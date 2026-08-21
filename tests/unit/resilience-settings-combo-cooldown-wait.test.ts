@@ -16,12 +16,12 @@ function cloneDefaults(): ResilienceSettings {
   return structuredClone(DEFAULT_RESILIENCE_SETTINGS);
 }
 
-test("default comboCooldownWait covers Gemini-class TPM/RPM waits (on, 90s ceiling, 5 attempts, 300s/5min budget)", () => {
+test("default comboCooldownWait bounds all-candidates-cooling waits to 5s", () => {
   const s = cloneDefaults().comboCooldownWait;
   assert.equal(s.enabled, true);
-  assert.equal(s.maxWaitMs, 90000);
-  assert.equal(s.maxAttempts, 5);
-  assert.equal(s.budgetMs, 300000);
+  assert.equal(s.maxWaitMs, 5000);
+  assert.equal(s.maxAttempts, 1);
+  assert.equal(s.budgetMs, 5000);
 });
 
 test("resolveResilienceSettings returns the default block when nothing is stored", () => {
@@ -49,8 +49,8 @@ test("mergeResilienceSettings round-trips a partial patch", () => {
   });
   assert.equal(merged.comboCooldownWait.maxWaitMs, 2000);
   // Unspecified fields keep the current value.
-  assert.equal(merged.comboCooldownWait.maxAttempts, 5);
-  assert.equal(merged.comboCooldownWait.budgetMs, 300000);
+  assert.equal(merged.comboCooldownWait.maxAttempts, 1);
+  assert.equal(merged.comboCooldownWait.budgetMs, 5000);
   assert.equal(merged.comboCooldownWait.enabled, true);
 });
 
@@ -96,7 +96,7 @@ test("garbage values fall back to the current numbers", () => {
       budgetMs: undefined,
     },
   });
-  assert.equal(merged.comboCooldownWait.maxWaitMs, 90000);
-  assert.equal(merged.comboCooldownWait.maxAttempts, 5);
-  assert.equal(merged.comboCooldownWait.budgetMs, 300000);
+  assert.equal(merged.comboCooldownWait.maxWaitMs, 5000);
+  assert.equal(merged.comboCooldownWait.maxAttempts, 1);
+  assert.equal(merged.comboCooldownWait.budgetMs, 5000);
 });

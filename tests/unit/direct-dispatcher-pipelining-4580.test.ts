@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { Dispatcher } from "undici";
 import {
   __createRoundRobinDispatcherForTest,
+  __createReuseAwareDispatcherForTest,
   __getDefaultDispatcherOptionsForTest,
   __getProxyDispatcherOptionsForTest,
   getDefaultDispatcherConnectionLimit,
@@ -14,14 +15,14 @@ afterEach(() => clearDispatcherCache());
 // #4580 — On the DIRECT egress path, concurrent same-provider requests serialized
 // behind a long/streaming request. The proxy dispatcher already got pipelining:0 +
 // a connections cap in #4288, but the first-attempt direct dispatcher
-// (getDispatcherOptions → new Agent) kept undici's default pipelining (1), so long
-// SSE streams bottlenecked the single pooled socket. The direct dispatcher now
-// mirrors that fix while KEEPING keep-alive (a proxy-only concern was the 1ms TTL).
+// Direct slots use pipelining=1 because Undici treats 0 as `Connection: close`.
+// ReuseAwareDispatcher preserves the original concurrency fix by selecting an idle
+// one-connection Agent whenever the warm slot still owns an active SSE response.
 
 describe("#4580 direct dispatcher options", () => {
-  it("disables pipelining so concurrent streams open separate sockets", () => {
+  it("keeps HTTP/1.1 keep-alive enabled while concurrency is handled above the Agent", () => {
     const opts = __getDefaultDispatcherOptionsForTest({});
-    assert.equal(opts.pipelining, 0);
+    assert.equal(opts.pipelining, 1);
   });
 
   it("caps connections to a finite number (default 32)", () => {
@@ -91,5 +92,43 @@ describe("#4580 direct dispatcher options", () => {
     for (let i = 0; i < 7; i++) dispatcher.dispatch(dispatchOptions, handler);
 
     assert.deepEqual(calls, [0, 1, 2, 0, 1, 2, 0]);
+  });
+
+  it("reuses the warm slot sequentially and fans out only while it is active", () => {
+    const calls: number[] = [];
+    const pending: Dispatcher.DispatchHandler[] = [];
+    const dispatchers = [0, 1, 2].map(
+      (index) =>
+        ({
+          dispatch(_options, handler) {
+            calls.push(index);
+            pending.push(handler);
+            return true;
+          },
+          close() {},
+          destroy() {},
+        }) as unknown as Dispatcher
+    );
+    const dispatcher = __createReuseAwareDispatcherForTest(dispatchers);
+    const dispatchOptions = {
+      origin: "https://api.groq.com",
+      path: "/openai/v1/chat/completions",
+      method: "POST",
+    } as unknown as Parameters<Dispatcher["dispatch"]>[0];
+    const handler = {} as Parameters<Dispatcher["dispatch"]>[1];
+
+    dispatcher.dispatch(dispatchOptions, handler);
+    pending.shift()?.onResponseEnd?.({} as never, {});
+    dispatcher.dispatch(dispatchOptions, handler);
+    pending.shift()?.onResponseEnd?.({} as never, {});
+    dispatcher.dispatch(dispatchOptions, handler);
+    pending.shift()?.onResponseEnd?.({} as never, {});
+    assert.deepEqual(calls, [0, 0, 0], "sequential calls should preserve socket locality");
+
+    calls.length = 0;
+    dispatcher.dispatch(dispatchOptions, handler);
+    dispatcher.dispatch(dispatchOptions, handler);
+    dispatcher.dispatch(dispatchOptions, handler);
+    assert.deepEqual(calls, [0, 1, 2], "concurrent active streams must retain fan-out");
   });
 });

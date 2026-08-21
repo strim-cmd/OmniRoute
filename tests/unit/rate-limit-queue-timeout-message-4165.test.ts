@@ -1,19 +1,9 @@
 /**
  * #4165 — surface a clear error when the request-queue (Bottleneck) drops a job.
  *
- * OmniRoute schedules every rate-limited request through Bottleneck with
- * `{ expiration: requestQueue.maxWaitMs }` (open-sse/services/rateLimitManager.ts).
- * When a job exceeds that budget Bottleneck throws the raw message
- * `"This job timed out after <N> ms."` — which is indistinguishable from an
- * upstream gateway timeout. In #4165 an operator spent ~3h misdiagnosing local
- * queue saturation as a provider outage because the 502 body / call-log
- * `last_error` carried that upstream-looking string across many providers.
- *
- * The fix rewrites that specific Bottleneck error into a clear, OmniRoute-owned
- * message that names the knob (`resilienceSettings.requestQueue.maxWaitMs`) and
- * explicitly says it is NOT an upstream timeout, while preserving the original
- * error as `.cause` and tagging `.code = "RATE_LIMIT_QUEUE_TIMEOUT"` so callers
- * can classify it. Behavior is unchanged: the job is still dropped.
+ * maxWaitMs limits time waiting for admission. It must never become Bottleneck's
+ * `expiration`, because expiration rejects an executing Promise without cancelling
+ * its network operation (the root cause of overlapping streaming POSTs).
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -41,8 +31,6 @@ test.after(() => {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });
 
-// Drive a real Bottleneck `expiration` failure: a tiny maxWaitMs and a job that
-// runs longer than it.
 async function triggerQueueTimeout() {
   await rateLimitManager.applyRequestQueueSettings({
     ...resilienceSettings.DEFAULT_RESILIENCE_SETTINGS.requestQueue,
@@ -53,17 +41,29 @@ async function triggerQueueTimeout() {
     maxWaitMs: 40,
   });
   rateLimitManager.enableRateLimitProtection("conn-queue-timeout");
-
-  return rateLimitManager.withRateLimit("openai", "conn-queue-timeout", "gpt-4o", async () => {
-    await wait(400); // > maxWaitMs (40ms) → Bottleneck fails the job
-    return "should-not-reach";
+  rateLimitManager.__setLimiterSettingsForTests("openai", "conn-queue-timeout", "gpt-4o", {
+    reservoir: 0,
+    reservoirRefreshAmount: 1,
+    reservoirRefreshInterval: 1000,
   });
+  let upstreamCalls = 0;
+  const pending = rateLimitManager.withRateLimit(
+    "openai",
+    "conn-queue-timeout",
+    "gpt-4o",
+    async () => {
+      upstreamCalls += 1;
+      return "must-not-run";
+    }
+  );
+  return { pending, upstreamCalls: () => upstreamCalls };
 }
 
 test("#4165 queue-timeout surfaces a clear OmniRoute error, not the raw upstream-looking string", async () => {
   let caught: (Error & { code?: string; cause?: { message?: string } }) | undefined;
   try {
-    await triggerQueueTimeout();
+    const triggered = await triggerQueueTimeout();
+    await triggered.pending;
     assert.fail("expected the queued job to be dropped");
   } catch (err) {
     caught = err as Error & { code?: string; cause?: { message?: string } };
@@ -87,27 +87,29 @@ test("#4165 queue-timeout surfaces a clear OmniRoute error, not the raw upstream
     "raw Bottleneck/upstream-looking string must not leak into the surfaced message"
   );
 
-  // The original Bottleneck error is preserved for debugging.
-  assert.ok(caught.cause, "original error should be preserved as cause");
-  assert.match(String(caught.cause?.message ?? ""), /This job timed out/);
+  const triggered = await triggerQueueTimeout();
+  await assert.rejects(triggered.pending);
+  await wait(80);
+  assert.equal(triggered.upstreamCalls(), 0, "expired queued wrapper must never start upstream");
 });
 
-test("#4165 a job that completes within maxWaitMs is unaffected", async () => {
+test("a running upstream may exceed maxWaitMs without rejection or duplicate execution", async () => {
   await rateLimitManager.applyRequestQueueSettings({
     ...resilienceSettings.DEFAULT_RESILIENCE_SETTINGS.requestQueue,
     autoEnableApiKeyProviders: false,
     concurrentRequests: 1,
     requestsPerMinute: 100000,
     minTimeBetweenRequestsMs: 0,
-    maxWaitMs: 5000,
+    maxWaitMs: 40,
   });
   rateLimitManager.enableRateLimitProtection("conn-fast");
 
-  const result = await rateLimitManager.withRateLimit(
-    "openai",
-    "conn-fast",
-    "gpt-4o",
-    async () => "ok"
-  );
+  let calls = 0;
+  const result = await rateLimitManager.withRateLimit("openai", "conn-fast", "gpt-4o", async () => {
+    calls += 1;
+    await wait(120);
+    return "ok";
+  });
   assert.equal(result, "ok");
+  assert.equal(calls, 1);
 });

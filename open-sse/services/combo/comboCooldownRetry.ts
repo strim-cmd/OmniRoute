@@ -177,6 +177,9 @@ export interface ResolveComboCooldownDecisionInput {
 export interface ResolveComboCooldownDecisionResult extends ShouldWaitForComboCooldownResult {
   /** Reason that drove the decision (for logging); null when none resolved. */
   reason: string | null;
+  targetIndex: number | null;
+  target: ComboCooldownTarget | null;
+  remainingMs: number;
 }
 
 /**
@@ -213,10 +216,24 @@ export function resolveComboCooldownWaitDecision(
   } = input;
 
   // Short-circuit before any lookup when the feature is off.
-  if (!settings.enabled) return { wait: false, waitMs: 0, reason: null };
+  if (!settings.enabled) {
+    return {
+      wait: false,
+      waitMs: 0,
+      reason: null,
+      targetIndex: null,
+      target: null,
+      remainingMs: 0,
+    };
+  }
 
-  let best: { reason: unknown; remainingMs: number } | null = null;
-  for (const target of targets) {
+  let best: {
+    reason: unknown;
+    remainingMs: number;
+    targetIndex: number;
+    target: ComboCooldownTarget;
+  } | null = null;
+  for (const [targetIndex, target] of targets.entries()) {
     const provider = typeof target.provider === "string" ? target.provider : "";
     if (!provider) continue;
     const connectionId = typeof target.connectionId === "string" ? target.connectionId : "";
@@ -228,11 +245,20 @@ export function resolveComboCooldownWaitDecision(
         : 0;
     if (remainingMs <= 0) continue;
     if (!best || remainingMs < best.remainingMs) {
-      best = { reason: info.reason, remainingMs };
+      best = { reason: info.reason, remainingMs, targetIndex, target };
     }
   }
 
-  if (!best) return { wait: false, waitMs: 0, reason: null };
+  if (!best) {
+    return {
+      wait: false,
+      waitMs: 0,
+      reason: null,
+      targetIndex: null,
+      target: null,
+      remainingMs: 0,
+    };
+  }
 
   // Wait long enough to actually clear the lock: the larger of the lock's own
   // remaining time and the upstream retry-after hint, plus a small margin.
@@ -254,5 +280,8 @@ export function resolveComboCooldownWaitDecision(
   return {
     ...decision,
     reason: typeof best.reason === "string" ? best.reason : null,
+    targetIndex: best.targetIndex,
+    target: best.target,
+    remainingMs: best.remainingMs,
   };
 }

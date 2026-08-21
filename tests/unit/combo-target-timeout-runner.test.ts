@@ -48,6 +48,36 @@ test("excede o limite: aborta e retorna 524 timed out", async () => {
   assert.match(JSON.stringify(body), /timed out/i);
 });
 
+test("timeout waits for the aborted target to settle before fallback may continue", async () => {
+  const events: string[] = [];
+  const runner = buildTargetTimeoutRunner({
+    handleSingleModel: (_b, _m, target) =>
+      new Promise<Response>((resolve) => {
+        const signal = (target as { modelAbortSignal?: AbortSignal } | undefined)
+          ?.modelAbortSignal;
+        assert.ok(signal);
+        signal.addEventListener(
+          "abort",
+          () => {
+            events.push("abort");
+            setTimeout(() => {
+              events.push("settled");
+              resolve(new Response(null, { status: 599 }));
+            }, 20);
+          },
+          { once: true }
+        );
+      }),
+    comboTargetTimeoutMs: 10,
+    log: noopLog,
+  });
+
+  const response = await runner({}, "slow-model");
+  events.push("returned");
+  assert.equal(response.status, 524);
+  assert.deepEqual(events, ["abort", "settled", "returned"]);
+});
+
 test("sucesso rápido vence a corrida do timeout", async () => {
   const runner = buildTargetTimeoutRunner({
     handleSingleModel: async () => new Response("fast", { status: 200 }),

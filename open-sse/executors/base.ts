@@ -76,6 +76,7 @@ import {
   stripTrailingAssistantForProvider,
 } from "../services/contextManager.ts";
 import { randomUUID } from "node:crypto";
+import { observeDiagnosticFetch } from "@/shared/utils/publicFunnelDiagnostics";
 import {
   CLAUDE_CODE_VERSION,
   CLAUDE_CODE_STAINLESS_VERSION,
@@ -249,7 +250,10 @@ function collectThinkingConfigs(body: unknown): Array<Record<string, unknown>> {
   if (!body || typeof body !== "object") return [];
   const root = body as Record<string, unknown>;
   const configs: Array<Record<string, unknown>> = [];
-  const envelopes: unknown[] = [root.generationConfig, (root.request as Record<string, unknown> | undefined)?.generationConfig];
+  const envelopes: unknown[] = [
+    root.generationConfig,
+    (root.request as Record<string, unknown> | undefined)?.generationConfig,
+  ];
   for (const env of envelopes) {
     if (!env || typeof env !== "object") continue;
     const tc = (env as Record<string, unknown>).thinkingConfig;
@@ -900,7 +904,7 @@ export class BaseExecutor {
             : requestOptions;
 
           try {
-            return await fetch(requestUrl, optionsWithSignal);
+            return await observeDiagnosticFetch(() => fetch(requestUrl, optionsWithSignal));
           } finally {
             if (timeoutId) clearTimeout(timeoutId);
           }
@@ -1403,6 +1407,7 @@ export class BaseExecutor {
               "CONTEXT_EDITING",
               `Upstream 400 rejected context_management on ${url} — retrying without it`
             );
+            await response.body?.cancel().catch(() => undefined);
             response = await fetchWithStartTimeout(url, { ...fetchOptions, body: retryBody });
           }
         }
@@ -1442,6 +1447,7 @@ export class BaseExecutor {
                 "THINKING_BUDGET",
                 `Upstream 400 rejected thinking_budget on ${url} — clamped to ${upstreamMax} and retrying (learned for ${this.provider}/${model})`
               );
+              await response.body?.cancel().catch(() => undefined);
               response = await fetchWithStartTimeout(url, { ...fetchOptions, body: retryBody });
             }
           }
@@ -1473,6 +1479,7 @@ export class BaseExecutor {
               "FIELD_400",
               `Upstream 400 rejected ${offending} on ${url} — retrying without it`
             );
+            await response.body?.cancel().catch(() => undefined);
             response = await fetchWithStartTimeout(url, { ...fetchOptions, body: retryBody });
           } else {
             // Auto-learn: detect "Unsupported parameter" errors and persist to DB
@@ -1498,6 +1505,7 @@ export class BaseExecutor {
                     "AUTO_LEARN",
                     `Auto-learned "${autoLearned}" for provider ${this.provider} (model: ${model}) from 400 on ${url} — retrying`
                   );
+                  await response.body?.cancel().catch(() => undefined);
                   response = await fetchWithStartTimeout(url, { ...fetchOptions, body: retryBody });
                 }
               } catch (learnError) {
@@ -1522,6 +1530,7 @@ export class BaseExecutor {
             "RETRY",
             `429 intra-retry ${attempt}/${BaseExecutor.RETRY_CONFIG.maxAttempts} on ${url} — waiting ${BaseExecutor.RETRY_CONFIG.delayMs}ms`
           );
+          await response.body?.cancel().catch(() => undefined);
           await new Promise((resolve) => setTimeout(resolve, BaseExecutor.RETRY_CONFIG.delayMs));
           urlIndex--; // re-run this urlIndex on the next loop iteration
           continue;
@@ -1535,6 +1544,7 @@ export class BaseExecutor {
         if (!skipUpstreamRetry && this.shouldRetry(response.status, urlIndex)) {
           log?.debug?.("RETRY", `${response.status} on ${url}, trying fallback ${urlIndex + 1}`);
           lastStatus = response.status;
+          await response.body?.cancel().catch(() => undefined);
           continue;
         }
 

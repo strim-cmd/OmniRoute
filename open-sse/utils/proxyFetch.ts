@@ -1,6 +1,7 @@
 // @ts-nocheck
 import "./setupPolyfill.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { fetch as undiciFetch } from "undici";
 import {
   buildVercelRelayHeaders,
@@ -9,6 +10,7 @@ import {
   getRetryDispatcher,
   isRelayType,
   normalizeProxyUrl,
+  publishDispatcherSelection,
   proxyConfigToUrl,
   proxyUrlForLogs,
 } from "./proxyDispatcher.ts";
@@ -355,6 +357,14 @@ function getTargetUrl(input) {
   return String(input);
 }
 
+function safeOriginHash(targetUrl: string): string {
+  let origin = "invalid-origin";
+  try {
+    origin = new URL(targetUrl).origin;
+  } catch {}
+  return createHash("sha256").update(origin).digest("hex").slice(0, 16);
+}
+
 export async function runWithProxyContext(
   proxyConfig,
   fn,
@@ -476,6 +486,13 @@ async function patchedFetch(
     // is incompatible with undici v8 dispatchers (missing onRequestStart, etc.)
     const _undiciDispatcher =
       deps.undiciFetch ?? (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>);
+    const targetUrl = getTargetUrl(input);
+    publishDispatcherSelection({
+      dispatcherId: "caller-owned-dispatcher",
+      poolId: `caller-${safeOriginHash(targetUrl)}`,
+      originHash: safeOriginHash(targetUrl),
+      dispatcherKind: "caller-owned",
+    });
     return _undiciDispatcher(input, options);
   }
 
@@ -496,12 +513,20 @@ async function patchedFetch(
       try {
         const store = tlsFingerprintContext.getStore();
         if (store) store.used = true;
-        return await tlsClient.fetch(targetUrl, {
+        const response = await tlsClient.fetch(targetUrl, {
           ...options,
           headers: options.headers,
           signal: options.signal ?? undefined,
         });
+        publishDispatcherSelection({
+          dispatcherId: "tls-fingerprint-client",
+          poolId: `tls-${safeOriginHash(targetUrl)}`,
+          originHash: safeOriginHash(targetUrl),
+          dispatcherKind: "tls-fingerprint",
+        });
+        return response;
       } catch (error) {
+        if (isCallerAbort(error, options.signal)) throw error;
         const message = error instanceof Error ? error.message : String(error);
         console.warn(
           `[ProxyFetch] TLS fingerprint failed, falling back to native fetch: ${message}`
@@ -538,6 +563,11 @@ async function patchedFetch(
           dispatcher: attempt === 0 ? getDefaultDispatcher() : getRetryDispatcher(),
         });
       } catch (dispatcherError) {
+        // A timeout/cancellation belongs to the current logical POST. Never turn
+        // it into a dispatcher retry, proxy fallback, or native-fetch replay.
+        // The rejected fetch is the transport settlement BaseExecutor waits for
+        // before it may evaluate a fallback URL/provider.
+        if (isCallerAbort(dispatcherError, options.signal)) throw dispatcherError;
         const msg =
           dispatcherError instanceof Error ? dispatcherError.message : String(dispatcherError);
         // CAUTION: Do NOT fallback to native fetch if the error is a version mismatch (invalid onRequestStart)
@@ -657,6 +687,12 @@ async function patchedFetch(
     if (process.env.OMNIROUTE_PROXY_FETCH_DEBUG === "true") {
       console.debug(`[ProxyFetch] Routing via ${vc.type || "edge"} relay: ${hostForLogs}`);
     }
+    publishDispatcherSelection({
+      dispatcherId: "edge-relay-fetch",
+      poolId: `relay-${safeOriginHash(`https://${vc.host}`)}`,
+      originHash: safeOriginHash(targetUrl),
+      dispatcherKind: "edge-relay",
+    });
     return await originalFetch(`https://${vc.host}`, {
       ...options,
       headers: mergedHeaders,
@@ -668,6 +704,13 @@ async function patchedFetch(
     const dispatcher = createProxyDispatcher(proxyUrl);
     const _undiciProxy =
       deps.undiciFetch ?? (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>);
+    const proxyIdentity = createHash("sha256").update(proxyUrl).digest("hex").slice(0, 16);
+    publishDispatcherSelection({
+      dispatcherId: `proxy-${proxyIdentity}`,
+      poolId: `proxy-${proxyIdentity}`,
+      originHash: safeOriginHash(targetUrl),
+      dispatcherKind: "proxy",
+    });
     return await _undiciProxy(input, {
       ...options,
       dispatcher,

@@ -12,7 +12,6 @@ const providersDb = await import("../../src/lib/db/providers.ts");
 const resilienceSettings = await import("../../src/lib/resilience/settings.ts");
 const rateLimitManager = await import("../../open-sse/services/rateLimitManager.ts");
 const accountFallback = await import("../../open-sse/services/accountFallback.ts");
-const Bottleneck = (await import("bottleneck")).default;
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -60,43 +59,41 @@ test("rate limit manager bypasses disabled connections and exposes inactive stat
   assert.deepEqual(rateLimitManager.getAllRateLimitStatus(), {});
 });
 
-test("idle-capacity queue expiry resets the limiter and retries once", async () => {
+test("combo admission observes limiter state changes after a READY probe without queueing", async () => {
   await rateLimitManager.applyRequestQueueSettings({
     ...resilienceSettings.DEFAULT_RESILIENCE_SETTINGS.requestQueue,
     autoEnableApiKeyProviders: false,
-    maxWaitMs: 20,
+    maxWaitMs: 5000,
     requestsPerMinute: 0,
     concurrentRequests: 1,
     minTimeBetweenRequestsMs: 0,
     maxQueueDepth: 0,
   });
 
-  const originalSchedule = Bottleneck.prototype.schedule;
-  let attempts = 0;
-  Bottleneck.prototype.schedule = function (...args) {
-    attempts++;
-    if (attempts === 1) {
-      return new Promise((_, reject) => {
-        setTimeout(() => reject(new Error("This job timed out after 20 ms.")), 30);
-      });
+  const connectionId = "atomic-admission-conn";
+  rateLimitManager.enableRateLimitProtection(connectionId);
+  const readiness = rateLimitManager.getRateLimitReadiness("openai", connectionId, "gpt-4o");
+  assert.equal(readiness.state, "ready");
+
+  rateLimitManager.__setLimiterSettingsForTests("openai", connectionId, "gpt-4o", {
+    reservoir: 0,
+    reservoirRefreshAmount: 1,
+    reservoirRefreshInterval: 40_000,
+  });
+  let upstreamCalls = 0;
+  const admission = await rateLimitManager.tryRunWithComboRateLimitAdmission(
+    "openai",
+    connectionId,
+    "gpt-4o",
+    async () => {
+      upstreamCalls += 1;
+      return "unexpected";
     }
-    return originalSchedule.apply(this, args);
-  };
-
-  try {
-    rateLimitManager.enableRateLimitProtection("idle-capacity-conn");
-    const result = await rateLimitManager.withRateLimit(
-      "openai",
-      "idle-capacity-conn",
-      "gpt-4o",
-      async () => "recovered"
-    );
-
-    assert.equal(result, "recovered");
-    assert.equal(attempts, 2, "the expired job should be retried once on a fresh limiter");
-  } finally {
-    Bottleneck.prototype.schedule = originalSchedule;
-  }
+  );
+  assert.equal(admission.state, "busy");
+  assert.equal(admission.reasonForWait, "reservoir_depleted");
+  assert.equal(upstreamCalls, 0);
+  assert.equal(admission.admissionKey, readiness.readinessKey);
 });
 
 test("withRateLimit forwards AbortController DOMException without mutating it", async () => {
@@ -188,6 +185,19 @@ test("rate limit manager handles 429 limiter teardown and disable cleanup", asyn
   await wait(25);
 
   assert.equal(rateLimitManager.getRateLimitStatus("openai", "conn-429").active, false);
+  const firstReadiness = rateLimitManager.getRateLimitReadiness("openai", "conn-429", "gpt-4o");
+  assert.equal(firstReadiness.state, "cooldown");
+  if (firstReadiness.state === "cooldown") {
+    assert.ok(firstReadiness.remainingMs > 0 && firstReadiness.remainingMs <= 1000);
+    assert.ok(firstReadiness.retryAt > Date.now());
+  }
+  // Readiness checks are observational: they must not recreate the evicted
+  // limiter, enqueue work, or consume capacity.
+  assert.equal(rateLimitManager.getRateLimitStatus("openai", "conn-429").active, false);
+  assert.equal(
+    rateLimitManager.getRateLimitReadiness("openai", "conn-429", "gpt-4o").state,
+    "cooldown"
+  );
 
   rateLimitManager.enableRateLimitProtection("conn-disable");
   rateLimitManager.updateFromHeaders(
@@ -207,6 +217,29 @@ test("rate limit manager handles 429 limiter teardown and disable cleanup", asyn
   rateLimitManager.disableRateLimitProtection("conn-disable");
   assert.equal(rateLimitManager.isRateLimitEnabled("conn-disable"), false);
   assert.equal(rateLimitManager.getRateLimitStatus("gemini", "conn-disable").active, false);
+});
+
+test("rate-limit readiness is model-scoped for Gemini", () => {
+  rateLimitManager.enableRateLimitProtection("conn-gemini-readiness");
+  rateLimitManager.updateFromHeaders(
+    "gemini",
+    "conn-gemini-readiness",
+    { "retry-after": "40s" },
+    429,
+    "gemini-a"
+  );
+  assert.equal(
+    rateLimitManager.getRateLimitReadiness("gemini", "conn-gemini-readiness", "gemini-a").state,
+    "cooldown"
+  );
+  assert.equal(
+    rateLimitManager.getRateLimitReadiness("gemini", "conn-gemini-readiness", "gemini-b").state,
+    "ready"
+  );
+  assert.equal(
+    rateLimitManager.getRateLimitReadiness("gemini", null, "gemini-a").state,
+    "unavailable"
+  );
 });
 
 test("rate limit manager uses model-scoped limiter keys for GitHub Copilot (#1624)", async () => {

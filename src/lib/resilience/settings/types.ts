@@ -65,12 +65,10 @@ export interface WaitForCooldownSettings {
 }
 
 /**
- * Combo cooldown-aware retry. When enabled, any combo strategy that would
- * crystallize a 429 `model_cooldown` for a SHORT transient cooldown waits it
- * out and re-dispatches instead. Guards (gating + the `quota_exhausted`/auth/
- * not-found exclusions) live in open-sse/services/combo/comboCooldownRetry.ts;
- * `maxWaitMs`/`maxAttempts`/`budgetMs` bound a single wait, the retry cycles,
- * and the total wait time.
+ * Combo-only pre-upstream wait policy. Known cooling targets are skipped while
+ * another candidate can be evaluated. These bounds apply only when every
+ * eligible target is cooling; direct/single-model rate-limit behavior is not
+ * controlled here.
  */
 export interface ComboCooldownWaitSettings {
   enabled: boolean;

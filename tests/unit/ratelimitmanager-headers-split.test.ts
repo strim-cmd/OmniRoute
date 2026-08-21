@@ -58,7 +58,7 @@ test("rateLimitManager/headers — STANDARD/ANTHROPIC header maps are objects wi
   assert.equal(typeof STANDARD_HEADERS.overLimit, "string");
 });
 
-// ── 2. host public API surface (17) ──────────────────────────────────────────
+// ── 2. host public API surface ────────────────────────────────────────────────
 
 const host = await import("../../open-sse/services/rateLimitManager.ts");
 
@@ -72,7 +72,7 @@ test.after(async () => {
   host.stopRateLimitWatchdog?.();
 });
 
-test("rateLimitManager.ts public API surface (17 names)", () => {
+test("rateLimitManager.ts public API surface", () => {
   const expected = [
     "__flushLearnedLimitsForTests",
     "__getLimiterStateForTests",
@@ -82,6 +82,7 @@ test("rateLimitManager.ts public API surface (17 names)", () => {
     "enableRateLimitProtection",
     "getAllRateLimitStatus",
     "getLearnedLimits",
+    "getRateLimitReadiness",
     "getRateLimitStatus",
     "initializeRateLimits",
     "isRateLimitEnabled",

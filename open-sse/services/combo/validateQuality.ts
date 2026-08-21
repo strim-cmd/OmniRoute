@@ -14,6 +14,11 @@ import {
 } from "../../utils/streamHelpers.ts";
 import { evaluateResponseValidation, type ResponseValidationConfig } from "./responseValidation.ts";
 import { getReasoningTokens } from "../../../src/lib/usage/tokenAccounting.ts";
+import {
+  classifyResponseOutputKinds,
+  requiresVisibleTextResponse,
+  type ResponseOutputKind,
+} from "../responseContract.ts";
 import type { ComboRetryAfter } from "./types.ts";
 
 export function toRetryAfterDisplayValue(value: ComboRetryAfter): string | Date {
@@ -201,6 +206,14 @@ function isStreamingUpstreamError(parsed: unknown, eventType: string): boolean {
 
 type StreamingPeekOutcome = "content" | "error" | null;
 
+export type ResponseQualityResult = {
+  valid: boolean;
+  reason?: string;
+  failureCategory?: "no_visible_content";
+  outputKinds?: ResponseOutputKind[];
+  clonedResponse?: Response;
+};
+
 /**
  * Validate that a successful (HTTP 200) non-streaming response actually contains
  * meaningful content. Returns { valid: true } or { valid: false, reason }.
@@ -225,7 +238,8 @@ export async function validateResponseQuality(
   isStreaming: boolean,
   log: { warn?: (...args: unknown[]) => void },
   responseValidation?: ResponseValidationConfig | null
-): Promise<{ valid: boolean; reason?: string; clonedResponse?: Response }> {
+): Promise<ResponseQualityResult> {
+  const visibleTextRequired = requiresVisibleTextResponse();
   // Issue #3685: For Claude SSE streaming responses, use a BOUNDED PEEK to
   // detect the empty-content-block pattern (content_filter stop_reason with
   // no content_block_* events) WITHOUT de-streaming non-empty responses.
@@ -239,11 +253,20 @@ export async function validateResponseQuality(
   if (isStreaming) {
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("text/event-stream")) {
-      return { valid: true };
+      return visibleTextRequired
+        ? validateResponseQuality(response, false, log, responseValidation)
+        : { valid: true };
     }
 
     if (!response.body) {
-      return { valid: true };
+      return visibleTextRequired
+        ? {
+            valid: false,
+            reason: "no visible assistant content",
+            failureCategory: "no_visible_content",
+            outputKinds: ["metadata"],
+          }
+        : { valid: true };
     }
 
     const reader = response.body.getReader();
@@ -275,6 +298,7 @@ export async function validateResponseQuality(
       hasLifecycleEnd: false,
     };
     let anyContentFound = false;
+    const observedOutputKinds = new Set<ResponseOutputKind>();
     // #7285: OpenAI-shape lifecycle tracking, parallel to `sse` above.
     const openAi: OpenAiLifecycleFlags = { hasChoicePayload: false, hasTerminalMarker: false };
     // User log 1784230812441-bf3789: the previous `!sawAnyBytes` gate below let
@@ -311,9 +335,9 @@ export async function validateResponseQuality(
     function isTerminalUsageOnlyChunk(parsed: Record<string, unknown>, eventType: string): boolean {
       return Boolean(
         parsed.usage &&
-          typeof parsed.usage === "object" &&
-          !Array.isArray(parsed.choices) &&
-          !eventType.startsWith("response.")
+        typeof parsed.usage === "object" &&
+        !Array.isArray(parsed.choices) &&
+        !eventType.startsWith("response.")
       );
     }
 
@@ -370,17 +394,24 @@ export async function validateResponseQuality(
           (typeof parsed.type === "string" ? parsed.type : null) || pendingEventType || "";
         pendingEventType = "";
 
+        const outputKinds = classifyResponseOutputKinds(parsed, eventType);
+        for (const kind of outputKinds) observedOutputKinds.add(kind);
+
         if (isStreamingUpstreamError(parsed, eventType)) {
           return "error";
         }
 
         if (isTerminalUsageOnlyChunk(parsed, eventType)) sawTerminator = true;
 
-        if (isKnownNonClaudeStreamPayload(parsed, eventType)) {
+        if (visibleTextRequired && outputKinds.includes("visible_text")) {
           return "content";
         }
 
-        if (applySseLifecycleEvent(eventType, parsed, sse)) {
+        if (!visibleTextRequired && isKnownNonClaudeStreamPayload(parsed, eventType)) {
+          return "content";
+        }
+
+        if (applySseLifecycleEvent(eventType, parsed, sse) && !visibleTextRequired) {
           return "content";
         }
         if (sse.hasLifecycleEnd) sawTerminator = true;
@@ -446,6 +477,19 @@ export async function validateResponseQuality(
             return { valid: false, reason: "streaming upstream error" };
           }
 
+          if (visibleTextRequired) {
+            log.warn?.(
+              "COMBO",
+              "Streaming response completed without ordinary visible text required by the client contract"
+            );
+            return {
+              valid: false,
+              reason: "no visible assistant content",
+              failureCategory: "no_visible_content",
+              outputKinds: [...observedOutputKinds],
+            };
+          }
+
           if (sse.hasMessageStart && sse.hasLifecycleEnd && !sse.hasRealContent) {
             // Complete Claude lifecycle with zero content blocks, or with
             // content_block_start/stop pairs that never carried real text/
@@ -504,7 +548,7 @@ export async function validateResponseQuality(
           // bytes. The reader is exhausted so the forwarding reader will
           // immediately signal done.
           const clonedResponse = buildReplayResponse(reader);
-          return { valid: true, clonedResponse };
+          return { valid: true, clonedResponse, outputKinds: [...observedOutputKinds] };
         }
 
         // Accumulate raw bytes for potential replay.
@@ -532,7 +576,7 @@ export async function validateResponseQuality(
           // is already in bufferedChunks) and then forwards the remainder of
           // the original reader unchanged.
           const clonedResponse = buildReplayResponse(reader);
-          return { valid: true, clonedResponse };
+          return { valid: true, clonedResponse, outputKinds: [...observedOutputKinds] };
         }
       }
     } catch (streamErr) {
@@ -625,7 +669,16 @@ export async function validateResponseQuality(
 
   const choices = json?.choices;
   if (json?.object === "response") {
-    if (!responsesApiOutputHasContent(json.output))
+    const outputKinds = classifyResponseOutputKinds(json);
+    if (visibleTextRequired && !outputKinds.includes("visible_text")) {
+      return {
+        valid: false,
+        reason: "no visible assistant content",
+        failureCategory: "no_visible_content",
+        outputKinds,
+      };
+    }
+    if (!visibleTextRequired && !responsesApiOutputHasContent(json.output))
       return { valid: false, reason: "empty_choices" };
     const status = typeof json.status === "string" ? json.status : "";
     if (status && !["completed", "done"].includes(status)) {
@@ -638,10 +691,19 @@ export async function validateResponseQuality(
         statusText: response.statusText,
         headers: response.headers,
       }),
+      outputKinds,
     };
   }
 
   if (!Array.isArray(choices) || choices.length === 0) {
+    if (visibleTextRequired) {
+      return {
+        valid: false,
+        reason: "no visible assistant content",
+        failureCategory: "no_visible_content",
+        outputKinds: classifyResponseOutputKinds(json),
+      };
+    }
     // `json?.error` is already handled unconditionally above (#6427); reaching
     // here means no error envelope was present.
     if (json?.output || json?.result || json?.data || json?.response) return { valid: true };
@@ -667,9 +729,9 @@ export async function validateResponseQuality(
   // (multimodal), or null. An empty array [] or an array of empty parts
   // must NOT count as valid content — only arrays with at least one
   // non-empty text/image part do.
-  let hasContent: boolean;
+  let hasVisibleContent: boolean;
   if (Array.isArray(content)) {
-    hasContent = content.some(
+    hasVisibleContent = content.some(
       (part) =>
         !!part &&
         typeof part === "object" &&
@@ -680,14 +742,25 @@ export async function validateResponseQuality(
           (part as Record<string, unknown>).type === "file")
     );
   } else {
-    hasContent =
-      (content !== null &&
-        content !== undefined &&
-        content !== "" &&
-        (typeof content !== "string" || content.trim().length > 0)) ||
-      hasReasoningContent;
+    hasVisibleContent =
+      content !== null &&
+      content !== undefined &&
+      content !== "" &&
+      (typeof content !== "string" || content.trim().length > 0);
   }
   const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+  const outputKinds = classifyResponseOutputKinds(json);
+
+  if (visibleTextRequired && !hasVisibleContent) {
+    return {
+      valid: false,
+      reason: "no visible assistant content",
+      failureCategory: "no_visible_content",
+      outputKinds,
+    };
+  }
+
+  const hasContent = hasVisibleContent || hasReasoningContent;
 
   if (!hasContent && !hasToolCalls) {
     return { valid: false, reason: "empty content and no tool_calls in response" };
@@ -722,6 +795,7 @@ export async function validateResponseQuality(
       statusText: response.statusText,
       headers: response.headers,
     }),
+    outputKinds,
   };
 }
 

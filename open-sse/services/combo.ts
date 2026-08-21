@@ -187,6 +187,16 @@ import {
 } from "./combo/providerWildcard.ts";
 import { resolveShadowTargets, scheduleShadowRouting } from "./combo/shadowRouting.ts";
 import { attemptCompatRejectedFallback } from "./combo/comboCompatFallback.ts";
+import { getRateLimitReadiness } from "./rateLimitManager.ts";
+import {
+  markComboWaitBudgetExceeded,
+  markComboWaitCompleted,
+  markComboWaitStarted,
+  markRouteSelected,
+  markTargetCompletedWithoutVisibleContent,
+  markTargetRateLimitState,
+  markTargetSkippedCooldown,
+} from "../../src/shared/utils/publicFunnelDiagnostics.ts";
 import {
   computeCompatRejectedTargets,
   describeCapabilityFilterExhaustion,
@@ -229,6 +239,71 @@ export {
   isRequestScopedUpstreamFailure,
   shouldSkipConnDisable,
 };
+
+type ComboTargetReadiness =
+  | { state: "ready"; readinessKey: string }
+  | { state: "unavailable"; readinessKey: null }
+  | { state: "busy"; readinessKey: string; queueDepth: number; reason: string }
+  | {
+      state: "cooldown";
+      readinessKey: string;
+      retryAt: number;
+      remainingMs: number;
+      reason: string;
+    };
+
+function resolveComboTargetReadiness(target: ResolvedComboTarget): ComboTargetReadiness {
+  const provider = target.provider;
+  const rawModel = parseModel(target.modelStr).model || target.modelStr;
+  const limiterState = getRateLimitReadiness(provider, target.connectionId, rawModel);
+  const lockout = provider
+    ? getModelLockoutInfo(provider, target.connectionId || "", rawModel)
+    : null;
+
+  const limiterCooldown =
+    limiterState.state === "cooldown"
+      ? {
+          retryAt: limiterState.retryAt,
+          remainingMs: limiterState.remainingMs,
+          reason: "rate_limit",
+        }
+      : null;
+  const lockoutRemaining =
+    lockout && Number.isFinite(lockout.remainingMs) ? Math.max(0, lockout.remainingMs) : 0;
+  const lockoutCooldown =
+    lockoutRemaining > 0
+      ? {
+          retryAt: Date.now() + lockoutRemaining,
+          remainingMs: lockoutRemaining,
+          reason: typeof lockout?.reason === "string" ? lockout.reason : "rate_limit",
+        }
+      : null;
+  const cooldown =
+    limiterCooldown && lockoutCooldown
+      ? limiterCooldown.remainingMs >= lockoutCooldown.remainingMs
+        ? limiterCooldown
+        : lockoutCooldown
+      : (limiterCooldown ?? lockoutCooldown);
+  if (cooldown) {
+    return {
+      state: "cooldown",
+      readinessKey: limiterState.readinessKey ?? "lockout_only",
+      ...cooldown,
+    };
+  }
+  if (limiterState.state === "unavailable") {
+    return { state: "unavailable", readinessKey: null };
+  }
+  if (limiterState.state === "busy") {
+    return {
+      state: "busy",
+      readinessKey: limiterState.readinessKey,
+      queueDepth: limiterState.queueDepth,
+      reason: limiterState.reason,
+    };
+  }
+  return { state: "ready", readinessKey: limiterState.readinessKey };
+}
 export { resolveShadowTargets, scheduleShadowRouting };
 export { preScreenTargets };
 export {
@@ -569,6 +644,7 @@ export async function handleComboChat({
   signal,
   apiKeyAllowedConnections = null,
   nesting = null,
+  correlationId = null,
 }: HandleComboChatOptions): Promise<Response> {
   const comboCtx = createComboContext({ body, combo, settings, relayOptions, log });
   const {
@@ -683,6 +759,7 @@ export async function handleComboChat({
       settings,
       allCombos,
       signal,
+      correlationId,
     });
   }
 
@@ -712,6 +789,13 @@ export async function handleComboChat({
   const { stickyWeightedLimit, getWeightedStepKeyForTarget, preScreenMap } = targetResolution;
   const _sticky = targetResolution.sticky;
   let orderedTargets = targetResolution.orderedTargets;
+  if (correlationId) {
+    markRouteSelected(correlationId, {
+      strategy,
+      provider: orderedTargets[0]?.provider ?? null,
+      model: orderedTargets[0]?.modelStr ?? null,
+    });
+  }
 
   // #5923 (Finding #4) — reset-window config for the shared per-target quota-
   // exhaustion cutoff below. The "auto" strategy already applies its own cutoff
@@ -938,9 +1022,54 @@ export async function handleComboChat({
           return null;
         }
 
-        // Pre-check: skip models locked by the resilience system (model-level lockout)
-        if (provider && rawModel && isModelLocked(provider, target.connectionId || "", rawModel)) {
-          log.info("COMBO", `Skipping ${modelStr} — model locked by resilience (cooldown active)`);
+        // Combo admission must never enter withRateLimit() for a target whose
+        // future retry time is already known. Skip it now so later candidates
+        // are evaluated immediately. If every candidate is cooling, the bounded
+        // all-cooldown policy at the end of this set decides whether to wait.
+        const targetReadiness = resolveComboTargetReadiness(target);
+        if (correlationId) {
+          markTargetRateLimitState(correlationId, {
+            provider: provider || "unknown",
+            model: modelStr,
+            targetIndex: i,
+            state: targetReadiness.state,
+            readinessKey: targetReadiness.readinessKey,
+            queueDepth: targetReadiness.state === "busy" ? targetReadiness.queueDepth : undefined,
+            reasonForWait:
+              targetReadiness.state === "cooldown" || targetReadiness.state === "busy"
+                ? targetReadiness.reason
+                : undefined,
+            remainingWaitMs:
+              targetReadiness.state === "cooldown" ? targetReadiness.remainingMs : undefined,
+          });
+        }
+        if (targetReadiness.state === "cooldown" || targetReadiness.state === "busy") {
+          if (targetReadiness.state === "busy") {
+            log.info(
+              "COMBO",
+              `Skipping ${modelStr} — limiter busy (queueDepth=${targetReadiness.queueDepth})`
+            );
+            if (i > 0) fallbackCount++;
+            return null;
+          }
+          const retryAt = new Date(targetReadiness.retryAt).toISOString();
+          if (!earliestRetryAfter || new Date(retryAt) < new Date(earliestRetryAfter)) {
+            earliestRetryAfter = retryAt;
+          }
+          lastStatus ??= 429;
+          lastError ??= `Known cooldown for ${modelStr}`;
+          log.info(
+            "COMBO",
+            `Skipping ${modelStr} — known cooldown ${targetReadiness.remainingMs}ms`
+          );
+          if (correlationId) {
+            markTargetSkippedCooldown(correlationId, {
+              provider: provider || "unknown",
+              model: modelStr,
+              targetIndex: i,
+              remainingWaitMs: targetReadiness.remainingMs,
+            });
+          }
           if (i > 0) fallbackCount++;
           return null;
         }
@@ -1172,6 +1301,9 @@ export async function handleComboChat({
             ...targetForAttempt,
             effectiveComboStrategy: strategy,
             failoverBeforeRetry: config.failoverBeforeRetry,
+            comboTargetIndex: i,
+            rateLimitReadinessKey: targetReadiness.readinessKey,
+            rateLimitReadinessState: targetReadiness.state,
           });
 
           // Success — validate response quality before returning
@@ -1200,6 +1332,14 @@ export async function handleComboChat({
             releaseQualityClone(qualityClone, result, quality);
             if (!quality.valid) {
               releaseRejectedQualityResponse(qualityClone, result);
+              if (correlationId && quality.failureCategory === "no_visible_content") {
+                markTargetCompletedWithoutVisibleContent(correlationId, {
+                  provider: provider || "unknown",
+                  model: modelStr,
+                  targetIndex: i,
+                  outputKinds: quality.outputKinds,
+                });
+              }
               log.warn(
                 "COMBO",
                 `Model ${modelStr} returned 200 but failed quality check: ${quality.reason}`
@@ -1730,7 +1870,7 @@ export async function handleComboChat({
             !isStreamReadinessFailure &&
             !isTokenLimitBreach &&
             [408, 429, 500, 502, 503, 504].includes(result.status);
-          if (retry < maxRetries && isTransient && !providerExhausted) {
+          if (retry < maxRetries && isTransient && result.status !== 429 && !providerExhausted) {
             if (
               provider &&
               rawModel &&
@@ -1997,8 +2137,11 @@ export async function handleComboChat({
         });
       }
 
-      // Retry the entire set if more attempts remain
-      if (setTry < maxSetRetries) continue;
+      // Generic set retries must not add an independent hidden delay after a
+      // rate-limit retry timestamp is known. Route that case directly into the
+      // bounded combo cooldown decision below; non-rate-limit failures retain
+      // the existing set-retry semantics.
+      if (setTry < maxSetRetries && !earliestRetryAfter) continue;
 
       // All set retries exhausted — return the final error
       if (!lastStatus) {
@@ -2058,10 +2201,11 @@ export async function handleComboChat({
           // single-model/multi-account (so this is identical to the previous
           // orderedTargets[0] behavior), but heterogeneous combos carry a
           // different model per target.
-          lookupLock: (provider, connectionId, target) => {
-            const rawModel = parseModel(target?.modelStr ?? "").model || "";
-            if (!rawModel) return null;
-            return getModelLockoutInfo(provider, connectionId, rawModel);
+          lookupLock: (_provider, _connectionId, target) => {
+            const resolved = resolveComboTargetReadiness(target as ResolvedComboTarget);
+            return resolved.state === "cooldown"
+              ? { reason: resolved.reason, remainingMs: resolved.remainingMs }
+              : null;
           },
           computeWaitMs: (retryAfter) => computeClosestRetryAfter(retryAfter).waitMs,
         });
@@ -2075,14 +2219,36 @@ export async function handleComboChat({
               comboCooldownAttempt + 1
             }/${resilienceSettings.comboCooldownWait.maxAttempts})`
           );
+          const waitTarget = decision.target;
+          const waitFields = {
+            provider: waitTarget?.provider || "unknown",
+            model: waitTarget?.modelStr || "unknown",
+            targetIndex: decision.targetIndex ?? -1,
+            remainingWaitMs: decision.remainingMs,
+            waitMs: decision.waitMs,
+          };
+          if (correlationId) markComboWaitStarted(correlationId, waitFields);
           const completed = await waitForCooldownAwareRetry(decision.waitMs, signal);
           if (!completed) {
             log.info("COMBO", `${strategy} cooldown wait aborted by client disconnect`);
             return errorResponse(499, "Request aborted");
           }
+          if (correlationId) markComboWaitCompleted(correlationId, waitFields);
           comboCooldownAttempt += 1;
           comboCooldownBudgetLeftMs = Math.max(0, comboCooldownBudgetLeftMs - decision.waitMs);
           return dispatchWithCooldownRetry();
+        }
+        if (decision.remainingMs > 0 && correlationId) {
+          markComboWaitBudgetExceeded(correlationId, {
+            provider: decision.target?.provider || "unknown",
+            model: decision.target?.modelStr || "unknown",
+            targetIndex: decision.targetIndex ?? -1,
+            remainingWaitMs: decision.remainingMs,
+            budgetMs: Math.min(
+              resilienceSettings.comboCooldownWait.maxWaitMs,
+              comboCooldownBudgetLeftMs
+            ),
+          });
         }
       }
 
@@ -2177,6 +2343,7 @@ async function handleRoundRobinCombo({
   settings,
   allCombos,
   signal,
+  correlationId,
 }: HandleRoundRobinOptions): Promise<Response> {
   const config = settings
     ? resolveComboConfig(combo, settings)
@@ -2430,6 +2597,95 @@ async function handleRoundRobinCombo({
   let fallbackCount = 0;
   let recordedAttempts = 0;
 
+  const rrReadinessByExecutionKey = new Map<string, ComboTargetReadiness>();
+  const refreshRoundRobinReadiness = () => {
+    rrReadinessByExecutionKey.clear();
+    for (const [targetIndex, target] of filteredTargets.entries()) {
+      const readiness = resolveComboTargetReadiness(target);
+      rrReadinessByExecutionKey.set(target.executionKey, readiness);
+      if (correlationId) {
+        markTargetRateLimitState(correlationId, {
+          provider: target.provider || "unknown",
+          model: target.modelStr,
+          targetIndex,
+          state: readiness.state,
+          remainingWaitMs: readiness.state === "cooldown" ? readiness.remainingMs : undefined,
+        });
+      }
+    }
+  };
+  refreshRoundRobinReadiness();
+
+  const rrCoolingTargets = filteredTargets.filter(
+    (target) => rrReadinessByExecutionKey.get(target.executionKey)?.state === "cooldown"
+  );
+  if (rrCoolingTargets.length > 0 && rrCoolingTargets.length === filteredTargets.length) {
+    const earliestRetryAt = Math.min(
+      ...rrCoolingTargets.map((target) => {
+        const readiness = rrReadinessByExecutionKey.get(target.executionKey);
+        return readiness?.state === "cooldown" ? readiness.retryAt : Number.POSITIVE_INFINITY;
+      })
+    );
+    const decision = resolveComboCooldownWaitDecision({
+      targets: filteredTargets,
+      earliestRetryAfter: new Date(earliestRetryAt).toISOString(),
+      attempt: 0,
+      budgetLeftMs: resilienceSettings.comboCooldownWait.budgetMs,
+      settings: resilienceSettings.comboCooldownWait,
+      lookupLock: (_provider, _connectionId, target) => {
+        const readiness = rrReadinessByExecutionKey.get(
+          (target as ResolvedComboTarget).executionKey
+        );
+        return readiness?.state === "cooldown"
+          ? { reason: readiness.reason, remainingMs: readiness.remainingMs }
+          : null;
+      },
+      computeWaitMs: (retryAfter) => computeClosestRetryAfter(retryAfter).waitMs,
+    });
+    const waitTarget = decision.target;
+    const diagnosticFields = {
+      provider: waitTarget?.provider || "unknown",
+      model: waitTarget?.modelStr || "unknown",
+      targetIndex: decision.targetIndex ?? -1,
+      remainingWaitMs: decision.remainingMs,
+    };
+    if (decision.wait) {
+      if (correlationId) {
+        markComboWaitStarted(correlationId, { ...diagnosticFields, waitMs: decision.waitMs });
+      }
+      const completed = await waitForCooldownAwareRetry(decision.waitMs, signal);
+      if (!completed) return errorResponse(499, "Request aborted");
+      if (correlationId) {
+        markComboWaitCompleted(correlationId, { ...diagnosticFields, waitMs: decision.waitMs });
+      }
+      refreshRoundRobinReadiness();
+    } else {
+      if (
+        correlationId &&
+        decision.remainingMs >
+          Math.min(
+            resilienceSettings.comboCooldownWait.maxWaitMs,
+            resilienceSettings.comboCooldownWait.budgetMs
+          )
+      ) {
+        markComboWaitBudgetExceeded(correlationId, {
+          ...diagnosticFields,
+          budgetMs: Math.min(
+            resilienceSettings.comboCooldownWait.maxWaitMs,
+            resilienceSettings.comboCooldownWait.budgetMs
+          ),
+        });
+      }
+      const retryAfter = new Date(earliestRetryAt).toISOString();
+      return unavailableResponse(
+        429,
+        "All round-robin combo targets are cooling down",
+        retryAfter,
+        formatRetryAfter(toRetryAfterDisplayValue(retryAfter))
+      );
+    }
+  }
+
   // #1731: Per-request in-memory set of providers whose quota is fully exhausted.
   // When a target returns a quota-exhausted 429, remaining targets from the same
   // provider are skipped to avoid the cascade through N same-provider targets.
@@ -2450,6 +2706,24 @@ async function handleRoundRobinCombo({
     const targetForAttempt = allowRateLimitedConnection
       ? { ...target, allowRateLimitedConnection: true }
       : target;
+
+    const targetReadiness = rrReadinessByExecutionKey.get(target.executionKey);
+    if (targetReadiness?.state === "cooldown") {
+      log.info(
+        "COMBO-RR",
+        `Skipping ${modelStr} — known cooldown ${targetReadiness.remainingMs}ms`
+      );
+      if (correlationId) {
+        markTargetSkippedCooldown(correlationId, {
+          provider: provider || "unknown",
+          model: modelStr,
+          targetIndex: modelIndex,
+          remainingWaitMs: targetReadiness.remainingMs,
+        });
+      }
+      if (offset > 0) fallbackCount++;
+      continue;
+    }
 
     // Pre-check availability
     if (isModelAvailable) {
@@ -2584,6 +2858,14 @@ async function handleRoundRobinCombo({
           releaseQualityClone(rrClone, result, quality);
           if (!quality.valid) {
             releaseRejectedQualityResponse(rrClone, result);
+            if (correlationId && quality.failureCategory === "no_visible_content") {
+              markTargetCompletedWithoutVisibleContent(correlationId, {
+                provider: provider || "unknown",
+                model: modelStr,
+                targetIndex: modelIndex,
+                outputKinds: quality.outputKinds,
+              });
+            }
             log.warn(
               "COMBO-RR",
               `${modelStr} returned 200 but failed quality check: ${quality.reason}`
@@ -2856,7 +3138,7 @@ async function handleRoundRobinCombo({
           !isStreamReadinessFailure &&
           !isTokenLimitBreach &&
           [408, 429, 500, 502, 503, 504].includes(result.status);
-        if (retry < maxRetries && isTransient && !providerExhausted) {
+        if (retry < maxRetries && isTransient && result.status !== 429 && !providerExhausted) {
           continue;
         }
 

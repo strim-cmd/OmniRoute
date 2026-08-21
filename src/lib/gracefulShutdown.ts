@@ -97,13 +97,21 @@ async function waitForDrain(): Promise<void> {
  */
 async function cleanup(): Promise<void> {
   try {
-    const [{ closeAuditDb }, { closeDbInstance }, { flushSpendBatchWriter }, { closeLogRotation }] =
-      await Promise.all([
-        import("@omniroute/open-sse/mcp-server/audit.ts"),
-        import("@/lib/db/core"),
-        import("@/lib/spend/batchWriter"),
-        import("@/lib/logRotation"),
-      ]);
+    const [
+      { closeAuditDb },
+      { closeDbInstance },
+      { flushSpendBatchWriter },
+      { closeLogRotation },
+      { closeDispatcherCache },
+    ] = await Promise.all([
+      import("@omniroute/open-sse/mcp-server/audit.ts"),
+      import("@/lib/db/core"),
+      import("@/lib/spend/batchWriter"),
+      import("@/lib/logRotation"),
+      import("@omniroute/open-sse/utils/proxyDispatcher.ts"),
+    ]);
+    await closeDispatcherCache();
+    console.log("[Shutdown] Upstream dispatcher pools closed.");
     const flushResult = await flushSpendBatchWriter();
     if (flushResult.flushedEntries > 0) {
       console.log(

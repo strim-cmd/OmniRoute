@@ -177,8 +177,22 @@ export async function executeWithUpstreamStartTimeout<T>({
     signal.addEventListener("abort", () => reject(createAbortError(signal)), { once: true });
   });
 
+  const executionPromise = execute(combinedController.signal);
+
   try {
-    return await Promise.race([execute(combinedController.signal), timeoutPromise, abortPromise]);
+    return await Promise.race([executionPromise, timeoutPromise, abortPromise]);
+  } catch (error) {
+    if (combinedController.signal.aborted) {
+      // A timed-out/cancelled POST must be fully settled before the caller can
+      // fall through to another provider. Returning from the race immediately
+      // leaves the original fetch alive and can create overlapping generations.
+      try {
+        await executionPromise;
+      } catch {
+        // Preserve the timeout/client-abort error that won the race.
+      }
+    }
+    throw error;
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
     if (abortListener) signal.removeEventListener("abort", abortListener);

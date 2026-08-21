@@ -92,6 +92,7 @@ import {
 } from "./reasoningRouting";
 import { createVirtualAutoCombo, resolveAutoRoutingState } from "./autoRouting";
 import { getComboFailureLogError } from "./comboFailureLogging";
+import { applyDirectVisibleTextContract } from "./chat/visibleTextContract";
 
 // Pipeline integration — wired modules
 import { classify429FromError, type FailureKind } from "@/shared/utils/classify429";
@@ -101,6 +102,11 @@ import { getCircuitBreaker, isLocalStreamLifecycleError } from "../../shared/uti
 import { markAccountExhaustedFrom429 } from "../../domain/quotaCache";
 import { RequestTelemetry, recordTelemetry } from "../../shared/utils/requestTelemetry";
 import { generateRequestId } from "../../shared/utils/requestId";
+import {
+  markPublicFunnelRequestValidated,
+  markRouteSelected,
+  markRouteSelectionStarted,
+} from "../../shared/utils/publicFunnelDiagnostics";
 import { logAuditEvent } from "../../lib/compliance/index";
 import { enforceApiKeyPolicy } from "../../shared/utils/apiKeyPolicy";
 import { hasProviderQuotaBypassScope } from "../../shared/constants/apiKeyPolicyScopes";
@@ -528,6 +534,9 @@ export async function handleChat(
   }));
   telemetry.endPhase();
 
+  markPublicFunnelRequestValidated(reqId, modelStr);
+  markRouteSelectionStarted(reqId, modelStr);
+
   // T08: per-key active session limit (0 = unlimited).
   if (apiKeyInfo?.id && sessionId) {
     const maxSessions =
@@ -791,6 +800,9 @@ export async function handleChat(
           providerId?: string | null;
           effectiveComboStrategy?: string | null;
           modelAbortSignal?: AbortSignal | null;
+          comboTargetIndex?: number;
+          rateLimitReadinessKey?: string | null;
+          rateLimitReadinessState?: string | null;
         }
       ) =>
         handleSingleModelChat(
@@ -817,6 +829,9 @@ export async function handleChat(
             cachedSettings: settings,
             providerId: target?.providerId ?? null,
             correlationId: reqId,
+            comboTargetIndex: target?.comboTargetIndex ?? null,
+            rateLimitReadinessKey: target?.rateLimitReadinessKey ?? null,
+            rateLimitReadinessState: target?.rateLimitReadinessState ?? null,
             modelPinned: (target as any)?.modelPinned ?? false,
             reasoningDecision,
             reasoningIntent,
@@ -869,7 +884,7 @@ export async function handleChat(
         `Combo "${combo.name}" exhausted — attempting global fallback: ${fallbackModel}`
       );
       try {
-        const fallbackResponse = await handleSingleModelChat(
+        const rawFallbackResponse = await handleSingleModelChat(
           body,
           fallbackModel,
           clientRawRequest,
@@ -885,6 +900,16 @@ export async function handleChat(
           },
           combo.strategy,
           true
+        );
+        const fallbackResponse = await applyDirectVisibleTextContract(
+          rawFallbackResponse,
+          {
+            isStreaming: body?.stream === true,
+            requestId: reqId,
+            provider: fallbackModel.split("/")[0] || "unknown",
+            model: fallbackModel,
+          },
+          log
         );
         if (fallbackResponse.ok) {
           log.info("GLOBAL_FALLBACK", `Global fallback ${fallbackModel} succeeded`);
@@ -931,6 +956,7 @@ export async function handleChat(
   telemetry.endPhase();
 
   // Single model request
+  markRouteSelected(reqId, { strategy: "single", model: resolvedModelStr });
   // Try to resolve routing combo from model prefix for compression combo lookup
   let routingComboId: string | null = null;
   if (!combo) {
@@ -967,8 +993,18 @@ export async function handleChat(
     null,
     false
   );
+  const contractResponse = await applyDirectVisibleTextContract(
+    response,
+    {
+      isStreaming: body?.stream === true,
+      requestId: reqId,
+      provider: resolvedModelStr.split("/")[0] || "unknown",
+      model: resolvedModelStr,
+    },
+    log
+  );
   recordTelemetry(telemetry);
-  return withCorrelationId(withSessionHeader(response, sessionId), reqId);
+  return withCorrelationId(withSessionHeader(contractResponse, sessionId), reqId);
 }
 
 // The clientRawRequest envelope lives in ./chat/clientRawRequest.ts. Imported for local use
@@ -1018,6 +1054,9 @@ async function handleSingleModelChat(
      * the signal used for the actual dispatch, not left unused.
      */
     modelAbortSignal?: AbortSignal | null;
+    comboTargetIndex?: number | null;
+    rateLimitReadinessKey?: string | null;
+    rateLimitReadinessState?: string | null;
   } = {},
   comboStrategy: string | null = null,
   isCombo: boolean = false
@@ -1443,6 +1482,9 @@ async function handleSingleModelChat(
         isCombo,
         comboStepId: runtimeOptions.comboStepId ?? null,
         comboExecutionKey: runtimeOptions.comboExecutionKey ?? runtimeOptions.comboStepId ?? null,
+        comboTargetIndex: runtimeOptions.comboTargetIndex ?? null,
+        rateLimitReadinessKey: runtimeOptions.rateLimitReadinessKey ?? null,
+        rateLimitReadinessState: runtimeOptions.rateLimitReadinessState ?? null,
         extendedContext,
         modelApiFormat: apiFormat,
         providerProfile,

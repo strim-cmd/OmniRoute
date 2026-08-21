@@ -68,9 +68,7 @@ export function buildTargetTimeoutRunner(deps: {
         parentHedgeSignal.addEventListener("abort", onParentHedgeAbort, { once: true });
       }
     }
-    try {
-      return await Promise.race([
-        handleSingleModel(b, modelStr, targetWithSignal).catch((err) => {
+    const executionPromise = handleSingleModel(b, modelStr, targetWithSignal).catch((err) => {
           if (timedOut) {
             // Inner call rejected because we aborted it. The synthetic 524 from
             // timeoutPromise already wins the race; return an empty response so
@@ -78,9 +76,16 @@ export function buildTargetTimeoutRunner(deps: {
             return new Response(null, { status: 599 });
           }
           return errorResponse(502, err?.message ?? "Upstream model error");
-        }),
-        timeoutPromise,
-      ]);
+        });
+    try {
+      const response = await Promise.race([executionPromise, timeoutPromise]);
+      if (timedOut) {
+        // Do not let the next combo candidate start until the timed-out logical
+        // POST has actually observed abort and settled. Otherwise Promise.race
+        // can leave an orphan request generating concurrently with fallback.
+        await executionPromise;
+      }
+      return response;
     } finally {
       clearTimeout(timeoutId);
       if (parentHedgeSignal && onParentHedgeAbort) {

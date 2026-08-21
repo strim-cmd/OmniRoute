@@ -286,6 +286,8 @@ import {
 } from "./responseSanitizer.ts";
 import {
   withRateLimit,
+  tryRunWithComboRateLimitAdmission,
+  getSafeRateLimitKey,
   updateFromHeaders,
   updateFromResponseBody,
   initializeRateLimits,
@@ -334,6 +336,18 @@ import {
   stripMarkdownCodeFence,
 } from "../utils/aiSdkCompat.ts";
 import { generateRequestId } from "@/shared/utils/requestId";
+import {
+  createUpstreamDiagnosticContext,
+  markAttemptFailed,
+  markUpstreamRequestStarted,
+  markUpstreamResponseHeaders,
+  markWaitCompleted,
+  markRateLimitAdmission,
+  monotonicNow,
+  observeUpstreamResponse,
+  classifyFailure,
+  runWithUpstreamDiagnosticContext,
+} from "@/shared/utils/publicFunnelDiagnostics";
 import { isLocalStreamLifecycleError } from "@/shared/utils/circuitBreaker";
 import { extractFacts } from "@/lib/memory/extraction";
 import { handleToolCallExecution } from "@/lib/skills/interception";
@@ -410,6 +424,9 @@ export async function handleChatCore({
   routingComboId = null,
   comboStepId = null,
   comboExecutionKey = null,
+  comboTargetIndex = null,
+  rateLimitReadinessKey = null,
+  rateLimitReadinessState = null,
   cachedSettings = null,
   skipUpstreamRetry = false,
   createPiiTransform = null,
@@ -2667,6 +2684,7 @@ export async function handleChatCore({
   const dedupEnabled = shouldDeduplicate(dedupRequestBody);
   const dedupHash = dedupEnabled ? computeRequestHash(dedupRequestBody) : null;
 
+  let latestDiagnosticAttemptIndex: number | null = null;
   const executeProviderRequest = async (modelToCall = effectiveModel, allowDedup = false) => {
     const execute = async () => {
       // Upstream body preparation extracted to chatCore/upstreamBody.ts (#3501 — first internal
@@ -2727,6 +2745,7 @@ export async function handleChatCore({
                 stage: "waiting_account_slot",
               });
             }
+            const accountSemaphoreWaitStartedAt = monotonicNow();
             const releaseAccountSemaphore =
               accountSemaphoreKey && accountSemaphoreMaxConcurrency != null
                 ? await acquireAccountSemaphore(accountSemaphoreKey, {
@@ -2734,29 +2753,70 @@ export async function handleChatCore({
                     signal: streamController.signal,
                   })
                 : () => {};
+            if (correlationId && accountSemaphoreKey && accountSemaphoreMaxConcurrency != null) {
+              markWaitCompleted(correlationId, "account_semaphore", accountSemaphoreWaitStartedAt);
+            }
             trace("post_semaphore");
             updatePendingScope(pendingScope, {
               stage: "waiting_rate_limit",
             });
 
+            const rateLimitWaitStartedAt = monotonicNow();
+            let rateLimitWaitRecorded = false;
+            const recordRateLimitWait = (failureCategory?: ReturnType<typeof classifyFailure>) => {
+              if (!correlationId || rateLimitWaitRecorded) return;
+              rateLimitWaitRecorded = true;
+              markWaitCompleted(
+                correlationId,
+                "rate_limit",
+                rateLimitWaitStartedAt,
+                undefined,
+                failureCategory
+              );
+            };
             try {
               trace("pre_rate_limit", { connectionId: attemptConnectionId });
-              const rawExecutorResult = await withRateLimit(
-                provider,
-                attemptConnectionId,
-                modelToCall,
-                async () => {
-                  trace("inside_rate_limit", { connectionId: attemptConnectionId });
-                  updatePendingScope(pendingScope, {
-                    stage: "rate_limit_slot_acquired",
-                  });
-                  return executeWithUpstreamStartTimeout({
-                    executor,
+              let diagnosticAttemptIndex: number | null = null;
+              let diagnosticContext: ReturnType<typeof createUpstreamDiagnosticContext> | null =
+                null;
+              const runAdmittedExecutor = async () => {
+                trace("inside_rate_limit", { connectionId: attemptConnectionId });
+                updatePendingScope(pendingScope, {
+                  stage: "rate_limit_slot_acquired",
+                });
+                if (correlationId) {
+                  recordRateLimitWait();
+                  if (isCombo) {
+                    markRateLimitAdmission(correlationId, {
+                      provider,
+                      model: modelToCall,
+                      targetIndex: comboTargetIndex,
+                      readinessKey: rateLimitReadinessKey,
+                      admissionKey: getSafeRateLimitKey(provider, attemptConnectionId, modelToCall),
+                      readinessState: rateLimitReadinessState,
+                      admissionState: "acquired",
+                      limiterStateAtAdmission: "ready_now",
+                      queueDepth: 0,
+                      computedWaitMs: 0,
+                      reasonForWait: "none",
+                    });
+                  }
+                  diagnosticContext = createUpstreamDiagnosticContext(
+                    correlationId,
                     provider,
-                    model: modelToCall,
-                    signal: streamController.signal,
-                    log,
-                    execute: (signal) =>
+                    modelToCall
+                  );
+                  diagnosticAttemptIndex = diagnosticContext.currentAttemptIndex;
+                  latestDiagnosticAttemptIndex = diagnosticAttemptIndex;
+                }
+                return executeWithUpstreamStartTimeout({
+                  executor,
+                  provider,
+                  model: modelToCall,
+                  signal: streamController.signal,
+                  log,
+                  execute: (signal) =>
+                    runWithUpstreamDiagnosticContext(diagnosticContext, () =>
                       runWithCapture(providerRequestCapture, () =>
                         executor.execute({
                           model: modelToCall,
@@ -2776,12 +2836,76 @@ export async function handleChatCore({
                           skipUpstreamRetry,
                           contextEditing: { enabled: contextEditingEnabled },
                         })
-                      ),
-                  });
-                },
-                streamController.signal
-              );
+                      )
+                    ),
+                });
+              };
+              let rawExecutorResult;
+              if (isCombo) {
+                const admission = await tryRunWithComboRateLimitAdmission(
+                  provider,
+                  attemptConnectionId,
+                  modelToCall,
+                  runAdmittedExecutor,
+                  streamController.signal
+                );
+                if (admission.state !== "acquired") {
+                  recordRateLimitWait("rate_limit_wait");
+                  if (correlationId) {
+                    markRateLimitAdmission(correlationId, {
+                      provider,
+                      model: modelToCall,
+                      targetIndex: comboTargetIndex,
+                      readinessKey: rateLimitReadinessKey,
+                      admissionKey: admission.admissionKey,
+                      readinessState: rateLimitReadinessState,
+                      admissionState: admission.state,
+                      limiterStateAtAdmission: admission.limiterStateAtAdmission,
+                      queueDepth: admission.queueDepth,
+                      computedWaitMs: admission.computedWaitMs,
+                      reasonForWait: admission.reasonForWait,
+                    });
+                  }
+                  const admissionError = new Error(
+                    `Combo target was not admitted by the local rate limiter (${admission.reasonForWait})`
+                  ) as Error & { code?: string; status?: number };
+                  admissionError.code =
+                    admission.state === "cooldown"
+                      ? "COMBO_RATE_LIMIT_COOLDOWN"
+                      : "COMBO_RATE_LIMIT_BUSY";
+                  admissionError.status = HTTP_STATUS.SERVICE_UNAVAILABLE;
+                  throw admissionError;
+                }
+                rawExecutorResult = admission.value;
+              } else {
+                rawExecutorResult = await withRateLimit(
+                  provider,
+                  attemptConnectionId,
+                  modelToCall,
+                  runAdmittedExecutor,
+                  streamController.signal
+                );
+              }
               const res = normalizeExecutorResult(rawExecutorResult);
+              if (correlationId) {
+                diagnosticAttemptIndex =
+                  diagnosticContext?.lastAttemptIndex ?? diagnosticAttemptIndex;
+                latestDiagnosticAttemptIndex = diagnosticAttemptIndex;
+                if (!diagnosticContext?.networkObserved) {
+                  markUpstreamResponseHeaders(
+                    correlationId,
+                    diagnosticAttemptIndex,
+                    res.response.status
+                  );
+                }
+                if (!diagnosticContext?.networkObserved && res.response.ok && res.response.body) {
+                  res.response = observeUpstreamResponse(
+                    res.response,
+                    correlationId,
+                    diagnosticAttemptIndex
+                  );
+                }
+              }
               trace("post_executor", { status: res?.response?.status });
 
               // Track Gemini RPM + RPD request counts for 429 classification
@@ -3077,6 +3201,7 @@ export async function handleChatCore({
                 _accountSemaphoreRelease: releaseAccountSemaphore,
               };
             } catch (error) {
+              recordRateLimitWait(classifyFailure(error));
               releaseAccountSemaphore();
               throw error;
             }
@@ -3337,6 +3462,13 @@ export async function handleChatCore({
             : error.status && typeof error.status === "number"
               ? error.status
               : HTTP_STATUS.BAD_GATEWAY;
+    if (correlationId) {
+      markAttemptFailed(
+        correlationId,
+        latestDiagnosticAttemptIndex,
+        classifyFailure(error, failureStatus)
+      );
+    }
     const failureMessage = isRequestAborted
       ? "Request aborted"
       : formatProviderError(error, provider, model, failureStatus);
@@ -3497,23 +3629,51 @@ export async function handleChatCore({
       // stay aligned if this block ever runs after a path that mutates body.model (e.g. fallback).
       try {
         const retryModelId = String(translatedBody.model || effectiveModel);
-        const retryResult = await runWithCapture(providerRequestCapture, () =>
-          executor.execute({
-            model: retryModelId,
-            body: translatedBody,
-            stream: upstreamStream,
-            credentials: getExecutionCredentials(),
-            signal: streamController.signal,
-            log,
-            extendedContext,
-            upstreamExtraHeaders: buildUpstreamHeadersForExecute(retryModelId),
-            clientHeaders: buildExecutorClientHeaders(clientRawRequest?.headers, userAgent),
-            clientResponseFormat,
-            onCredentialsRefreshed,
-            skipUpstreamRetry: isCombo,
-            contextEditing: { enabled: contextEditingEnabled },
-          })
+        const refreshRetryDiagnosticContext = correlationId
+          ? createUpstreamDiagnosticContext(correlationId, provider, retryModelId)
+          : null;
+        let retryResult = await runWithUpstreamDiagnosticContext(
+          refreshRetryDiagnosticContext,
+          () =>
+            runWithCapture(providerRequestCapture, () =>
+              executor.execute({
+                model: retryModelId,
+                body: translatedBody,
+                stream: upstreamStream,
+                credentials: getExecutionCredentials(),
+                signal: streamController.signal,
+                log,
+                extendedContext,
+                upstreamExtraHeaders: buildUpstreamHeadersForExecute(retryModelId),
+                clientHeaders: buildExecutorClientHeaders(clientRawRequest?.headers, userAgent),
+                clientResponseFormat,
+                onCredentialsRefreshed,
+                skipUpstreamRetry: isCombo,
+                contextEditing: { enabled: contextEditingEnabled },
+              })
+            )
         );
+        if (correlationId && refreshRetryDiagnosticContext) {
+          latestDiagnosticAttemptIndex =
+            refreshRetryDiagnosticContext.lastAttemptIndex ?? latestDiagnosticAttemptIndex;
+          if (!refreshRetryDiagnosticContext.networkObserved) {
+            markUpstreamResponseHeaders(
+              correlationId,
+              latestDiagnosticAttemptIndex,
+              retryResult.response.status
+            );
+            if (retryResult.response.ok && retryResult.response.body) {
+              retryResult = {
+                ...retryResult,
+                response: observeUpstreamResponse(
+                  retryResult.response,
+                  correlationId,
+                  latestDiagnosticAttemptIndex
+                ),
+              };
+            }
+          }
+        }
 
         if (retryResult.response.ok) {
           providerResponse = retryResult.response;
@@ -4659,6 +4819,13 @@ export async function handleChatCore({
       code: streamReadiness.code,
       type: streamReadiness.type,
     };
+    if (correlationId) {
+      markAttemptFailed(
+        correlationId,
+        latestDiagnosticAttemptIndex,
+        classifyFailure({ code: streamReadiness.code })
+      );
+    }
     trackPendingRequest(model, provider, connectionId, false);
     appendRequestLog({
       model,

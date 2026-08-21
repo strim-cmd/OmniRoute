@@ -130,7 +130,10 @@ export async function awaitProviderDefaultSlot(
 ): Promise<void> {
   const cfg = getProviderDefaultRateLimit(provider);
   if (!cfg) return;
-  const budget = Math.max(cfg.windowMs, maxWaitMs && maxWaitMs > 0 ? maxWaitMs : 0);
+  // A configured maxWaitMs is a hard local admission budget, not a lower bound.
+  // The previous Math.max(windowMs, maxWaitMs) silently expanded a 5s/15s budget
+  // to the provider's full 60s window.
+  const budget = maxWaitMs && maxWaitMs > 0 ? maxWaitMs : cfg.windowMs;
   const start = Date.now();
   for (;;) {
     const waitMs = acquireProviderDefaultSlot(provider, connectionId);

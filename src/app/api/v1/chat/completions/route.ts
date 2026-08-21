@@ -2,10 +2,20 @@ import { z } from "zod";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { callCloudWithMachineId } from "@/shared/utils/cloud";
 import { handleChat } from "@/sse/handlers/chat";
-import { generateRequestId } from "@/shared/utils/requestId";
+import {
+  markPublicFunnelRequestFailed,
+  observeClientResponse,
+  resolveOmniaRequestId,
+  startPublicFunnelRequest,
+} from "@/shared/utils/publicFunnelDiagnostics";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { initTranslators } from "@omniroute/open-sse/translator/index.ts";
 import { createInjectionGuard } from "@/middleware/promptInjectionGuard";
+import {
+  resolveClientResponseContract,
+  runWithClientResponseContract,
+  VISIBLE_TEXT_RESPONSE_CONTRACT,
+} from "@omniroute/open-sse/services/responseContract.ts";
 import { acceptHeaderForcesStream } from "@omniroute/open-sse/utils/aiSdkCompat.ts";
 import {
   OPENAI_CHAT_ERROR_FRAME,
@@ -76,6 +86,27 @@ export async function OPTIONS() {
 }
 
 export async function POST(request) {
+  const reqId = resolveOmniaRequestId(request.headers);
+  const responseContract = resolveClientResponseContract(request.headers);
+  const visibleTextRequired = responseContract === VISIBLE_TEXT_RESPONSE_CONTRACT;
+  let endpointHost = "unknown";
+  try {
+    endpointHost = new URL(request.url).hostname;
+  } catch {}
+  startPublicFunnelRequest(reqId, endpointHost);
+  return runWithClientResponseContract(responseContract, async () => {
+    try {
+      return observeClientResponse(await handlePost(request, reqId), reqId, request.signal, {
+        visibleTextRequired,
+      });
+    } catch (error) {
+      markPublicFunnelRequestFailed(reqId, error);
+      throw error;
+    }
+  });
+}
+
+async function handlePost(request, reqId: string) {
   await ensureInitialized();
 
   // Content-Type guard (#6414) — reject non-JSON POST bodies with 415 per RFC 7231.
@@ -135,7 +166,9 @@ export async function POST(request) {
           if (!shapeCheck.success) {
             const issue = shapeCheck.error.issues[0];
             const field = issue?.path?.length ? issue.path.join(".") : "body";
-            return finishAdmission(errorResponse(400, `${field}: ${issue?.message ?? "Invalid request"}`));
+            return finishAdmission(
+              errorResponse(400, `${field}: ${issue?.message ?? "Invalid request"}`)
+            );
           }
         }
 
@@ -184,7 +217,6 @@ export async function POST(request) {
     const compressionRequestHeader = readCompressionRequestHeader(request);
 
     if (wantsStreaming) {
-      const reqId = generateRequestId();
       // Wrap the real handler response, not the synthetic early-keepalive response. If the
       // client cancels while handleChat is still pending, earlyStreamKeepalive will cancel the
       // eventual handler body; only that confirmed cleanup releases heavyweight capacity.
@@ -205,7 +237,7 @@ export async function POST(request) {
 
     return finishAdmission(
       withCompressionHeaderEcho(
-        await handleChat(request, null, parsedBody),
+        await handleChat(request, null, parsedBody, reqId),
         compressionRequestHeader
       )
     );

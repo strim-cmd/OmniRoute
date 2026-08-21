@@ -6,6 +6,7 @@ import {
   createUpstreamStartTimeoutError,
   createAbortError,
   computeBillableTokens,
+  executeWithUpstreamStartTimeout,
   getExecutorTimeoutMs,
   normalizeExecutorResult,
 } from "../../open-sse/handlers/chatCore/upstreamTimeouts.ts";
@@ -48,4 +49,32 @@ test("normalizeExecutorResult wraps bare Response and passes through rich result
   const rich = normalizeExecutorResult({ response: r, url: "u", headers: { a: "b" } });
   assert.equal(rich.url, "u");
   assert.equal(rich.headers.a, "b");
+});
+
+test("upstream start timeout waits for aborted execution to settle", async () => {
+  const events: string[] = [];
+  const promise = executeWithUpstreamStartTimeout({
+    executor: { getTimeoutMs: () => 10 },
+    provider: "gemini",
+    model: "slow",
+    signal: new AbortController().signal,
+    execute: (signal) =>
+      new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            events.push("abort");
+            setTimeout(() => {
+              events.push("settled");
+              reject(signal.reason);
+            }, 20);
+          },
+          { once: true }
+        );
+      }),
+  });
+
+  await assert.rejects(promise, { name: "TimeoutError" });
+  events.push("returned");
+  assert.deepEqual(events, ["abort", "settled", "returned"]);
 });

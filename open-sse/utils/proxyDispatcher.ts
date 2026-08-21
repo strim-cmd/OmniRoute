@@ -7,6 +7,7 @@ import { createSocksDispatcherWithFamily } from "./socksConnectorWithFamily.ts";
 import {
   clearDispatcherCache,
   createRoundRobinDispatcher,
+  createReuseAwareDispatcher,
   getDefaultCachedDispatcher,
   getDispatcherCache,
   getRetryCachedDispatcher,
@@ -14,7 +15,12 @@ import {
   setRetryCachedDispatcher,
 } from "./proxyDispatcherCache.ts";
 
-export { __cacheProxyDispatcherForTest, clearDispatcherCache } from "./proxyDispatcherCache.ts";
+export {
+  __cacheProxyDispatcherForTest,
+  clearDispatcherCache,
+  closeDispatcherCache,
+  publishDispatcherSelection,
+} from "./proxyDispatcherCache.ts";
 
 const SUPPORTED_PROTOCOLS = new Set(["http:", "https:", "socks5:"]);
 // Edge-relay proxy types. These do NOT go through an HTTP/SOCKS dispatcher —
@@ -132,15 +138,14 @@ export function getDefaultDispatcherConnectionLimit(
 
 function getDefaultDispatcherOptions(env: Record<string, string | undefined> = process.env) {
   const options = getDispatcherOptions();
-  // #4580 — On the direct egress path, undici's default pipelining (1) let a long
-  // SSE stream monopolize the single pooled socket per origin. Keep the public
-  // connection-limit option here, but getDefaultDispatcher() fans it out across
-  // independent one-connection Agents; in production traces, one multi-connection
-  // Agent could still queue same-origin Codex streams behind prior trailers.
+  // Undici uses pipelining=0 as its explicit no-keep-alive mode and sends
+  // `Connection: close`. Keep pipelining=1 on direct slots; the reuse-aware
+  // dispatcher prevents concurrent SSE POSTs from sharing a slot and fans them
+  // out across independent one-connection Agents instead.
   return {
     ...options,
     connections: getDefaultDispatcherConnectionLimit(env),
-    pipelining: 0,
+    pipelining: 1,
   };
 }
 
@@ -149,10 +154,10 @@ function createRoundRobinDirectDispatcher(connectionLimit: number): Dispatcher {
   const perAgentOptions = {
     ...baseOptions,
     connections: 1,
-    pipelining: 0,
+    pipelining: 1,
   };
   const dispatchers = Array.from({ length: connectionLimit }, () => new Agent(perAgentOptions));
-  return createRoundRobinDispatcher(dispatchers);
+  return createReuseAwareDispatcher(dispatchers);
 }
 
 export function getDefaultDispatcher(): Dispatcher {
@@ -427,6 +432,10 @@ export function __getDefaultDispatcherOptionsForTest(
 
 export function __createRoundRobinDispatcherForTest(dispatchers: Dispatcher[]): Dispatcher {
   return createRoundRobinDispatcher(dispatchers);
+}
+
+export function __createReuseAwareDispatcherForTest(dispatchers: Dispatcher[]): Dispatcher {
+  return createReuseAwareDispatcher(dispatchers);
 }
 
 export function createProxyDispatcher(proxyUrl: string): Dispatcher {

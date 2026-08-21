@@ -56,6 +56,9 @@ export type SingleModelTarget =
       allowRateLimitedConnection?: boolean;
       effectiveComboStrategy?: string | null;
       modelAbortSignal?: AbortSignal | null;
+      comboTargetIndex?: number;
+      rateLimitReadinessKey?: string | null;
+      rateLimitReadinessState?: string | null;
       /** True when this target was selected via context-cache session pinning. */
       modelPinned?: boolean;
     })
@@ -107,6 +110,7 @@ export type HandleComboChatOptions = {
   signal?: AbortSignal | null;
   apiKeyAllowedConnections?: string[] | null;
   nesting?: ComboNestingContext | null;
+  correlationId?: string | null;
 };
 
 export type HandleRoundRobinOptions = Omit<
