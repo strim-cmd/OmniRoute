@@ -19,12 +19,23 @@ export function __resetLiveWsForwardingState(): void {
   liveWsDisabledUntil = 0;
 }
 
+function isLiveWsForwardingEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const value = env.OMNIROUTE_ENABLE_LIVE_WS;
+
+  if (value === undefined) return true;
+
+  return value === "1" || value.toLowerCase() === "true";
+}
+
 export async function forwardDashboardEventToLiveWs(
   event: string,
   payload: unknown,
   fetchImpl: typeof fetch = fetch,
   now: () => number = Date.now
 ): Promise<void> {
+  // LiveWS disabled means there is intentionally no sidecar on :20132.
+  if (!isLiveWsForwardingEnabled()) return;
+
   // Skip while the bridge is in a cooldown window after repeated failures.
   if (liveWsDisabledUntil > now()) return;
 

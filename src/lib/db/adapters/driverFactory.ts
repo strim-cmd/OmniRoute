@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { createBetterSqliteAdapter } from "./betterSqliteAdapter";
 import { createBunSqliteAdapter, type BunSqliteDatabaseLike } from "./bunSqliteAdapter";
@@ -8,7 +7,15 @@ import {
 } from "./nodeSqliteShared";
 import type { SqliteAdapter } from "./types";
 
-const _require = createRequire(import.meta.url);
+// Resolve external SQLite drivers through Node itself at runtime.
+
+// Using createRequire(import.meta.url) here is rewritten by the Next/Webpack
+
+// standalone bundle and breaks both better-sqlite3 and node:sqlite.
+
+const runtimeModule = process.getBuiltinModule("module") as typeof import("node:module");
+
+const _require = runtimeModule.createRequire(`${process.cwd()}/package.json`);
 
 type DriverLoader = (moduleName: string) => unknown;
 

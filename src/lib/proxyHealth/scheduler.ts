@@ -12,12 +12,13 @@
  */
 
 import { deleteProxyById, listProxies, updateProxy } from "@/lib/localDb";
-import { createProxyDispatcher, clearDispatcherCache } from "@omniroute/open-sse/utils/proxyDispatcher";
-import { fetch as undiciFetch } from "undici";
 import {
-  decideProxyHealthAction,
-  type ProxyProbeOutcome,
-} from "./decision.ts";
+  createProxyDispatcher,
+  clearDispatcherCache,
+} from "@omniroute/open-sse/utils/proxyDispatcher";
+import { shouldUseDispatcherHealthProbe } from "./probeMode.ts";
+import { fetch as undiciFetch } from "undici";
+import { decideProxyHealthAction, type ProxyProbeOutcome } from "./decision.ts";
 
 // #6246: a HEAD to the public probe target through a legit (often loaded) proxy
 // can exceed a few seconds; the old 5s ceiling produced false negatives that
@@ -88,6 +89,9 @@ async function testOneProxy(proxy: {
   host: string;
   port: number;
 }): Promise<ProxyProbeOutcome> {
+  // Cloudflare/Vercel/Deno relays require x-relay-* headers and are not HTTP/SOCKS proxies.
+  if (!shouldUseDispatcherHealthProbe(proxy.type)) return "inconclusive";
+
   const proxyUrl = `${proxy.type}://${proxy.host}:${proxy.port}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TEST_TIMEOUT_MS);
@@ -161,7 +165,11 @@ async function sweep(): Promise<void> {
         if (await deleteProxyById(id, { force: true }).catch(() => false)) {
           failureMap.delete(id);
           removed++;
-          try { clearDispatcherCache(); } catch { /* non-critical */ }
+          try {
+            clearDispatcherCache();
+          } catch {
+            /* non-critical */
+          }
         }
       }
     }

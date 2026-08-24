@@ -81,3 +81,26 @@ test("a success resets the failure counter", async () => {
   await forwardDashboardEventToLiveWs("e", {}, impl, clock.now);
   assert.equal(calls, before + 1);
 });
+
+test("does not forward when LiveWS is explicitly disabled", async () => {
+  const previous = process.env.OMNIROUTE_ENABLE_LIVE_WS;
+
+  process.env.OMNIROUTE_ENABLE_LIVE_WS = "0";
+
+  let calls = 0;
+
+  const impl = async () => {
+    calls++;
+
+    return new Response("ok");
+  };
+
+  try {
+    await forwardDashboardEventToLiveWs("compression.step", {}, impl);
+
+    assert.equal(calls, 0);
+  } finally {
+    if (previous === undefined) delete process.env.OMNIROUTE_ENABLE_LIVE_WS;
+    else process.env.OMNIROUTE_ENABLE_LIVE_WS = previous;
+  }
+});
