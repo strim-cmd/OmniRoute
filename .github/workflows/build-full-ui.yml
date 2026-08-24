@@ -1,0 +1,110 @@
+name: Build Full UI Standalone
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-ui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Full UI standalone
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+      OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
+      OMNIROUTE_USE_TURBOPACK: "0"
+      OMNIROUTE_BUILD_MEMORY_MB: "8192"
+      OMNIROUTE_BUILD_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        uses: ./.github/actions/npm-ci-retry
+
+      - name: Build full UI
+        run: npm run build
+
+      - name: Make standalone portable
+        run: >-
+          node --input-type=module -e
+          'import { assembleStandalone } from "./scripts/build/assembleStandalone.mjs";
+          assembleStandalone({distDir:".build/next",outDir:".build/next/standalone",
+          projectRoot:process.cwd(),sanitizePaths:true,patchTurbopackChunks:true,
+          copyNatives:true,materializeSymlinks:true});'
+
+      - name: Verify full standalone
+        run: |
+          test -f .build/next/standalone/server.js
+          test -f .build/next/standalone/dev/run-standalone.mjs
+          test -f .build/next/standalone/BUILD_OMNIROUTE_BASE_PATH
+          test -d .build/next/standalone/.build/next/static
+          test -d .build/next/standalone/public
+          if grep -Rqs 'omniroute:backend-only-stub' src/app; then
+            echo "Backend-only dashboard stubs detected"
+            exit 1
+          fi
+          du -sh .build/next/standalone
+
+      - name: Smoke test standalone
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DATA_DIR="$RUNNER_TEMP/omniroute-smoke"
+          export JWT_SECRET="ci-smoke-jwt-secret-0123456789"
+          export API_KEY_SECRET="ci-smoke-api-secret-0123456789"
+          export STORAGE_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+          export INITIAL_PASSWORD="ci-smoke-password"
+          export PORT=30128
+          export OMNIROUTE_SERVER_HOST=127.0.0.1
+          export OMNIROUTE_ENABLE_LIVE_WS=0
+          export PROXY_HEALTH_ENABLED=false
+          mkdir -p "$DATA_DIR"
+          (
+            cd .build/next/standalone
+            node dev/run-standalone.mjs >"$RUNNER_TEMP/omniroute-smoke.log" 2>&1
+          ) &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:30128/api/monitoring/health | grep -q '"status":"healthy"'; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ok" != "1" ]; then
+            cat "$RUNNER_TEMP/omniroute-smoke.log"
+            exit 1
+          fi
+          curl -fsSL http://127.0.0.1:30128/ -o "$RUNNER_TEMP/root.html"
+          test -s "$RUNNER_TEMP/root.html"
+
+      - name: Package standalone
+        run: tar --zstd -cf "omniroute-full-ui-${GITHUB_SHA}.tar.zst" -C .build/next standalone
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: omniroute-full-ui-${{ github.sha }}
+          path: omniroute-full-ui-${{ github.sha }}.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
