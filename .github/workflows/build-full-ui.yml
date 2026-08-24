@@ -2,6 +2,8 @@ name: Build Full UI Standalone
 
 on:
   workflow_dispatch:
+  push:
+    branches: [safety/overnight-hardening-20260821]
 
 permissions:
   contents: read
