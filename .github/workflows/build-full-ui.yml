@@ -69,8 +69,8 @@ jobs:
         run: |
           set -euo pipefail
           export DATA_DIR="$RUNNER_TEMP/omniroute-smoke"
-          export JWT_SECRET="ci-smoke-jwt-secret-0123456789"
-          export API_KEY_SECRET="ci-smoke-api-secret-0123456789"
+          export JWT_SECRET="$(openssl rand -hex 32)"
+          export API_KEY_SECRET="$(openssl rand -hex 32)"
           export STORAGE_ENCRYPTION_KEY="$(openssl rand -hex 32)"
           export INITIAL_PASSWORD="ci-smoke-password"
           export PORT=30128
