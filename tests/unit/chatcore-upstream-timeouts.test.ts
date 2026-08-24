@@ -78,3 +78,26 @@ test("upstream start timeout waits for aborted execution to settle", async () =>
   events.push("returned");
   assert.deepEqual(events, ["abort", "settled", "returned"]);
 });
+
+test("parent abort still reaches a live body after response headers", async () => {
+  const parent = new AbortController();
+  let transportSignal: AbortSignal | null = null;
+  const response = await executeWithUpstreamStartTimeout({
+    executor: { getTimeoutMs: () => 1000 },
+    provider: "gemini",
+    model: "streaming",
+    signal: parent.signal,
+    execute: async (signal) => {
+      transportSignal = signal;
+      return new Response(new ReadableStream({ start() {} }), {
+        headers: { "content-type": "text/event-stream" },
+      });
+    },
+  });
+  assert.ok(response.body);
+  assert.equal(transportSignal?.aborted, false);
+  parent.abort(new Error("post-headers-budget"));
+  assert.equal(transportSignal?.aborted, true);
+  assert.match(String(transportSignal?.reason), /post-headers-budget/);
+  await response.body.cancel();
+});

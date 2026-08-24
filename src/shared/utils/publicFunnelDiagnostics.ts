@@ -91,12 +91,17 @@ type UpstreamDiagnosticContext = {
   lastAttemptIndex: number | null;
   networkObserved: boolean;
   activeNetworkAttemptIndex: number | null;
+  transportObserver?: {
+    onRequestHeadersSent?: () => void;
+    onResponseHeaders?: (status?: number) => void;
+  } | null;
 };
 const upstreamDiagnosticStore = new AsyncLocalStorage<UpstreamDiagnosticContext>();
 type UndiciRequestBinding = {
   requestId: string;
   attemptIndex: number;
   socket?: object;
+  transportObserver?: UpstreamDiagnosticContext["transportObserver"];
 };
 const undiciRequests = new WeakMap<object, UndiciRequestBinding>();
 const usedUndiciSockets = new WeakSet<object>();
@@ -401,6 +406,42 @@ export function markComboWaitBudgetExceeded(
     remainingWaitMs: fields.remainingWaitMs,
     budgetMs: fields.budgetMs,
     failureCategory: "rate_limit_wait",
+  });
+}
+
+export function markComboAttemptBudgetEvent(
+  requestId: string,
+  fields: {
+    event: "started" | "expired_no_alternate" | "aborted";
+    phase: "response_headers" | "visible_content";
+    budgetMs: number;
+    elapsedMs?: number;
+    provider: string;
+    model: string;
+    targetIndex: number;
+    alternateProvider?: string;
+    alternateModel?: string;
+    alternateTargetIndex?: number;
+  }
+) {
+  const state = getState(requestId);
+  if (!state) return;
+  emit(state, `combo_attempt_budget_${fields.event}`, {
+    provider: fields.provider.slice(0, 120),
+    model: fields.model.slice(0, 255),
+    targetIndex: fields.targetIndex,
+    budgetPhase: fields.phase,
+    budgetMs: fields.budgetMs,
+    elapsedMs: fields.elapsedMs,
+    alternateProvider: fields.alternateProvider?.slice(0, 120),
+    alternateModel: fields.alternateModel?.slice(0, 255),
+    alternateTargetIndex: fields.alternateTargetIndex,
+    failureCategory:
+      fields.event === "aborted"
+        ? fields.phase === "visible_content"
+          ? "first_token_timeout"
+          : "upstream_timeout"
+        : undefined,
   });
 }
 
@@ -751,7 +792,8 @@ export function classifyFailure(error?: unknown, status?: number): FailureCatego
 export function createUpstreamDiagnosticContext(
   requestId: string,
   provider: string,
-  model: string
+  model: string,
+  transportObserver?: UpstreamDiagnosticContext["transportObserver"]
 ): UpstreamDiagnosticContext {
   const initialAttempt = markUpstreamRequestStarted(requestId, provider, model);
   return {
@@ -762,6 +804,7 @@ export function createUpstreamDiagnosticContext(
     lastAttemptIndex: initialAttempt,
     networkObserved: false,
     activeNetworkAttemptIndex: null,
+    transportObserver,
   };
 }
 
@@ -785,6 +828,7 @@ export async function observeDiagnosticFetch(handler: () => Promise<Response>): 
   try {
     const response = await handler();
     markUpstreamResponseHeaders(context.requestId, attemptIndex, response.status);
+    context.transportObserver?.onResponseHeaders?.(response.status);
     return response.ok && response.body
       ? observeUpstreamResponse(response, context.requestId, attemptIndex)
       : response;
@@ -802,6 +846,7 @@ function activeUndiciBinding(): UndiciRequestBinding | null {
   return {
     requestId: context.requestId,
     attemptIndex: context.activeNetworkAttemptIndex,
+    transportObserver: context.transportObserver,
   };
 }
 
@@ -927,6 +972,7 @@ function subscribeUndiciDiagnostics() {
           httpProtocol: record.socket ? socketHttpProtocol(record.socket) : undefined,
         });
         markUpstreamRequestHeadersSent(binding.requestId, binding.attemptIndex);
+        binding.transportObserver?.onRequestHeadersSent?.();
       }
       if (record.socket) usedUndiciSockets.add(record.socket);
     } catch {
@@ -949,6 +995,7 @@ function subscribeUndiciDiagnostics() {
         markUpstreamResponseHeaders(binding.requestId, binding.attemptIndex, status, {
           upstreamConnectionHeader: connectionHeader,
         });
+        binding.transportObserver?.onResponseHeaders?.(status);
       }
     } catch {
       // Diagnostics are strictly best effort and must never affect fetch.

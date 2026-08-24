@@ -803,6 +803,10 @@ export async function handleChat(
           comboTargetIndex?: number;
           rateLimitReadinessKey?: string | null;
           rateLimitReadinessState?: string | null;
+          upstreamTransportObserver?: {
+            onRequestHeadersSent: () => void;
+            onResponseHeaders: (status?: number) => void;
+          } | null;
         }
       ) =>
         handleSingleModelChat(
@@ -832,6 +836,7 @@ export async function handleChat(
             comboTargetIndex: target?.comboTargetIndex ?? null,
             rateLimitReadinessKey: target?.rateLimitReadinessKey ?? null,
             rateLimitReadinessState: target?.rateLimitReadinessState ?? null,
+            upstreamTransportObserver: target?.upstreamTransportObserver ?? null,
             modelPinned: (target as any)?.modelPinned ?? false,
             reasoningDecision,
             reasoningIntent,
@@ -1057,6 +1062,10 @@ async function handleSingleModelChat(
     comboTargetIndex?: number | null;
     rateLimitReadinessKey?: string | null;
     rateLimitReadinessState?: string | null;
+    upstreamTransportObserver?: {
+      onRequestHeadersSent: () => void;
+      onResponseHeaders: (status?: number) => void;
+    } | null;
   } = {},
   comboStrategy: string | null = null,
   isCombo: boolean = false
@@ -1096,6 +1105,10 @@ async function handleSingleModelChat(
           providerId?: string | null;
           effectiveComboStrategy?: string | null;
           modelAbortSignal?: AbortSignal | null;
+          upstreamTransportObserver?: {
+            onRequestHeadersSent: () => void;
+            onResponseHeaders: (status?: number) => void;
+          } | null;
         }
       ) =>
         handleSingleModelChat(
@@ -1119,6 +1132,7 @@ async function handleSingleModelChat(
             correlationId: runtimeOptions?.correlationId ?? null,
             // #7360 follow-up — see the primary handleSingleModel closure above.
             modelAbortSignal: target?.modelAbortSignal ?? null,
+            upstreamTransportObserver: target?.upstreamTransportObserver ?? null,
           },
           target?.effectiveComboStrategy ?? redirectCombo.strategy ?? "priority",
           false
@@ -1485,6 +1499,7 @@ async function handleSingleModelChat(
         comboTargetIndex: runtimeOptions.comboTargetIndex ?? null,
         rateLimitReadinessKey: runtimeOptions.rateLimitReadinessKey ?? null,
         rateLimitReadinessState: runtimeOptions.rateLimitReadinessState ?? null,
+        upstreamTransportObserver: runtimeOptions.upstreamTransportObserver ?? null,
         extendedContext,
         modelApiFormat: apiFormat,
         providerProfile,

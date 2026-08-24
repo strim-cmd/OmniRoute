@@ -427,6 +427,7 @@ export async function handleChatCore({
   comboTargetIndex = null,
   rateLimitReadinessKey = null,
   rateLimitReadinessState = null,
+  upstreamTransportObserver = null,
   cachedSettings = null,
   skipUpstreamRetry = false,
   createPiiTransform = null,
@@ -2804,7 +2805,8 @@ export async function handleChatCore({
                   diagnosticContext = createUpstreamDiagnosticContext(
                     correlationId,
                     provider,
-                    modelToCall
+                    modelToCall,
+                    upstreamTransportObserver
                   );
                   diagnosticAttemptIndex = diagnosticContext.currentAttemptIndex;
                   latestDiagnosticAttemptIndex = diagnosticAttemptIndex;
@@ -3630,7 +3632,12 @@ export async function handleChatCore({
       try {
         const retryModelId = String(translatedBody.model || effectiveModel);
         const refreshRetryDiagnosticContext = correlationId
-          ? createUpstreamDiagnosticContext(correlationId, provider, retryModelId)
+          ? createUpstreamDiagnosticContext(
+              correlationId,
+              provider,
+              retryModelId,
+              upstreamTransportObserver
+            )
           : null;
         let retryResult = await runWithUpstreamDiagnosticContext(
           refreshRetryDiagnosticContext,

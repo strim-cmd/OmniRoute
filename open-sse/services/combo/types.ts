@@ -7,6 +7,7 @@
  */
 
 import type { ProviderCandidate } from "../autoCombo/scoring.ts";
+import type { UpstreamTransportPhaseObserver } from "./attemptBudget.ts";
 
 export const RESET_WINDOW_NAMES = ["weekly", "session", "monthly"] as const;
 
@@ -59,6 +60,7 @@ export type SingleModelTarget =
       comboTargetIndex?: number;
       rateLimitReadinessKey?: string | null;
       rateLimitReadinessState?: string | null;
+      upstreamTransportObserver?: UpstreamTransportPhaseObserver | null;
       /** True when this target was selected via context-cache session pinning. */
       modelPinned?: boolean;
     })

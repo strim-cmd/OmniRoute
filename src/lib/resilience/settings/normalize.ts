@@ -16,6 +16,8 @@ import type {
   ProviderBreakerProfileSettings,
   WaitForCooldownSettings,
   ComboCooldownWaitSettings,
+  ComboAttemptBudgetProfileSettings,
+  ComboAttemptBudgetSettings,
   QuotaShareConcurrencyLimitSettings,
   ProviderCooldownSettings,
   QuotaPreflightSettings,
@@ -341,6 +343,56 @@ export function normalizeComboCooldownWaitSettings(
   return { enabled, maxWaitMs, maxAttempts, budgetMs };
 }
 
+function normalizeComboAttemptBudgetProfile(
+  next: unknown,
+  fallback: ComboAttemptBudgetProfileSettings
+): ComboAttemptBudgetProfileSettings {
+  const record = asRecord(next);
+  const responseHeadersMs = toInteger(record.responseHeadersMs, fallback.responseHeadersMs, {
+    min: 1000,
+    max: 120000,
+  });
+  const firstVisibleContentMs = toInteger(
+    record.firstVisibleContentMs,
+    fallback.firstVisibleContentMs,
+    { min: responseHeadersMs, max: 120000 }
+  );
+  return { responseHeadersMs, firstVisibleContentMs };
+}
+
+function normalizeComboAttemptBudgetMap(
+  next: unknown,
+  fallback: Record<string, ComboAttemptBudgetProfileSettings>,
+  defaultProfile: ComboAttemptBudgetProfileSettings
+): Record<string, ComboAttemptBudgetProfileSettings> {
+  const source = { ...fallback, ...asRecord(next) };
+  const normalized: Record<string, ComboAttemptBudgetProfileSettings> = {};
+  for (const [rawKey, value] of Object.entries(source)) {
+    const key = rawKey.trim().toLowerCase().slice(0, 255);
+    if (!key) continue;
+    normalized[key] = normalizeComboAttemptBudgetProfile(value, fallback[key] ?? defaultProfile);
+  }
+  return normalized;
+}
+
+export function normalizeComboAttemptBudgetSettings(
+  next: unknown,
+  fallback: ComboAttemptBudgetSettings
+): ComboAttemptBudgetSettings {
+  const record = asRecord(next);
+  const defaultProfile = normalizeComboAttemptBudgetProfile(record.default, fallback.default);
+  return {
+    enabled: toBoolean(record.enabled, fallback.enabled),
+    recheckIntervalMs: toInteger(record.recheckIntervalMs, fallback.recheckIntervalMs, {
+      min: 100,
+      max: 5000,
+    }),
+    default: defaultProfile,
+    providers: normalizeComboAttemptBudgetMap(record.providers, fallback.providers, defaultProfile),
+    models: normalizeComboAttemptBudgetMap(record.models, fallback.models, defaultProfile),
+  };
+}
+
 export function normalizeQuotaShareConcurrencyLimitSettings(
   next: unknown,
   fallback: QuotaShareConcurrencyLimitSettings
@@ -389,7 +441,8 @@ function normalizeProviderQuotaOverrideEntry(raw: unknown): ProviderQuotaOverrid
   const out: ProviderQuotaOverrideSettings = {};
   const rpm = typeof record.rpm === "number" ? record.rpm : Number(record.rpm);
   if (Number.isFinite(rpm) && rpm > 0) out.rpm = Math.trunc(rpm);
-  const concurrency = typeof record.concurrency === "number" ? record.concurrency : Number(record.concurrency);
+  const concurrency =
+    typeof record.concurrency === "number" ? record.concurrency : Number(record.concurrency);
   if (Number.isFinite(concurrency) && concurrency > 0) out.concurrency = Math.trunc(concurrency);
   return Object.keys(out).length > 0 ? out : null;
 }

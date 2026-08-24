@@ -11,6 +11,7 @@ import {
   normalizeProviderBreakerProfile,
   normalizeWaitForCooldownSettings,
   normalizeComboCooldownWaitSettings,
+  normalizeComboAttemptBudgetSettings,
   normalizeQuotaShareConcurrencyLimitSettings,
   normalizeProviderCooldownSettings,
   normalizeQuotaPreflightSettings,
@@ -26,6 +27,8 @@ export type {
   ProviderBreakerProfileSettings,
   WaitForCooldownSettings,
   ComboCooldownWaitSettings,
+  ComboAttemptBudgetProfileSettings,
+  ComboAttemptBudgetSettings,
   QuotaShareConcurrencyLimitSettings,
   ProviderCooldownSettings,
   QuotaPreflightSettings,
@@ -102,6 +105,23 @@ export const DEFAULT_RESILIENCE_SETTINGS: ResilienceSettings = {
     maxWaitMs: 5000,
     maxAttempts: 1,
     budgetMs: 5000,
+  },
+  // Evidence-based combo-only attempt budgets. Expiry is fail-open when no
+  // later target is currently admissible; direct requests are unaffected.
+  comboAttemptBudget: {
+    enabled: true,
+    recheckIntervalMs: 500,
+    default: { responseHeadersMs: 15000, firstVisibleContentMs: 20000 },
+    providers: {
+      groq: { responseHeadersMs: 10000, firstVisibleContentMs: 12000 },
+      gemini: { responseHeadersMs: 12000, firstVisibleContentMs: 15000 },
+    },
+    models: {
+      "gemini/gemini-3.5-flash": {
+        responseHeadersMs: 8000,
+        firstVisibleContentMs: 8000,
+      },
+    },
   },
   // FASE 2.1: serialize concurrent quota-share requests per connection when the
   // connection sets a max_concurrent cap, so a subscription account is not
@@ -247,6 +267,7 @@ function buildLegacyFallback(settings: JsonRecord): ResilienceSettings {
       ),
     },
     comboCooldownWait: DEFAULT_RESILIENCE_SETTINGS.comboCooldownWait,
+    comboAttemptBudget: DEFAULT_RESILIENCE_SETTINGS.comboAttemptBudget,
     quotaShareConcurrencyLimit: DEFAULT_RESILIENCE_SETTINGS.quotaShareConcurrencyLimit,
     providerCooldown: DEFAULT_RESILIENCE_SETTINGS.providerCooldown,
     quotaPreflight: DEFAULT_RESILIENCE_SETTINGS.quotaPreflight,
@@ -315,6 +336,10 @@ export function resolveResilienceSettings(
       current.comboCooldownWait,
       fallback.comboCooldownWait
     ),
+    comboAttemptBudget: normalizeComboAttemptBudgetSettings(
+      current.comboAttemptBudget,
+      fallback.comboAttemptBudget
+    ),
     quotaShareConcurrencyLimit: normalizeQuotaShareConcurrencyLimitSettings(
       current.quotaShareConcurrencyLimit,
       fallback.quotaShareConcurrencyLimit
@@ -371,6 +396,10 @@ export function mergeResilienceSettings(
     comboCooldownWait: normalizeComboCooldownWaitSettings(
       updates.comboCooldownWait,
       current.comboCooldownWait
+    ),
+    comboAttemptBudget: normalizeComboAttemptBudgetSettings(
+      updates.comboAttemptBudget,
+      current.comboAttemptBudget
     ),
     quotaShareConcurrencyLimit: normalizeQuotaShareConcurrencyLimitSettings(
       updates.quotaShareConcurrencyLimit,

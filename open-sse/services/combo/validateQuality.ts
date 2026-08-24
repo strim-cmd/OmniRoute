@@ -237,7 +237,8 @@ export async function validateResponseQuality(
   response: Response,
   isStreaming: boolean,
   log: { warn?: (...args: unknown[]) => void },
-  responseValidation?: ResponseValidationConfig | null
+  responseValidation?: ResponseValidationConfig | null,
+  onVisibleContent?: () => void
 ): Promise<ResponseQualityResult> {
   const visibleTextRequired = requiresVisibleTextResponse();
   // Issue #3685: For Claude SSE streaming responses, use a BOUNDED PEEK to
@@ -404,6 +405,7 @@ export async function validateResponseQuality(
         if (isTerminalUsageOnlyChunk(parsed, eventType)) sawTerminator = true;
 
         if (visibleTextRequired && outputKinds.includes("visible_text")) {
+          onVisibleContent?.();
           return "content";
         }
 
@@ -580,6 +582,13 @@ export async function validateResponseQuality(
         }
       }
     } catch (streamErr) {
+      // A budget/client abort can reject reader.read() while the clone remains
+      // locked. Release this abandoned tee branch so the caller can cancel both
+      // branches deterministically before sequential fallback.
+      void reader.cancel().catch(() => {});
+      try {
+        reader.releaseLock();
+      } catch {}
       // If reading the stream fails due to a locked stream or pipe error,
       // the content cannot be verified — mark as invalid for combo failover.
       // A locked ReadableStream means the response body is already consumed
@@ -684,6 +693,7 @@ export async function validateResponseQuality(
     if (status && !["completed", "done"].includes(status)) {
       return { valid: false, reason: "no_terminal" };
     }
+    if (outputKinds.includes("visible_text")) onVisibleContent?.();
     return {
       valid: true,
       clonedResponse: new Response(text, {
@@ -759,6 +769,7 @@ export async function validateResponseQuality(
       outputKinds,
     };
   }
+  if (hasVisibleContent) onVisibleContent?.();
 
   const hasContent = hasVisibleContent || hasReasoningContent;
 
@@ -837,4 +848,15 @@ export function releaseRejectedQualityResponse(clone: Response, original: Respon
     void clone.body?.cancel().catch(() => {});
   }
   void original.body?.cancel().catch(() => {});
+}
+
+/** Await both tee branches when cancellation ordering is a correctness gate. */
+export async function settleRejectedQualityResponse(
+  clone: Response,
+  original: Response
+): Promise<void> {
+  const cancellations: Promise<unknown>[] = [];
+  if (clone !== original && clone.body) cancellations.push(clone.body.cancel());
+  if (original.body) cancellations.push(original.body.cancel());
+  await Promise.allSettled(cancellations);
 }

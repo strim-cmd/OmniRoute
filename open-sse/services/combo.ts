@@ -127,8 +127,17 @@ import {
   validateResponseQuality,
   releaseQualityClone,
   releaseRejectedQualityResponse,
+  settleRejectedQualityResponse,
   toRetryAfterDisplayValue,
 } from "./combo/validateQuality.ts";
+import {
+  ComboAttemptBudgetGuard,
+  resolveComboAttemptBudgetProfile,
+  type ComboAttemptBudgetEvent,
+  type ComboAttemptBudgetTrigger,
+  type ComboAttemptBudgetAlternate,
+} from "./combo/attemptBudget.ts";
+import { requiresVisibleTextResponse } from "./responseContract.ts";
 import {
   resolveComboCooldownWaitDecision,
   ResolveComboCooldownDecisionResult,
@@ -192,6 +201,7 @@ import {
   markComboWaitBudgetExceeded,
   markComboWaitCompleted,
   markComboWaitStarted,
+  markComboAttemptBudgetEvent,
   markRouteSelected,
   markTargetCompletedWithoutVisibleContent,
   markTargetRateLimitState,
@@ -970,6 +980,74 @@ export async function handleComboChat({
       const abortControllers = new Map<number, AbortController>();
       const zeroLatencyOptimizationsEnabled = config.zeroLatencyOptimizationsEnabled === true;
 
+      // Budget expiry may abort the current transport only when a later target
+      // is usable right now. This probe is deliberately non-mutating: it does
+      // not reserve a limiter permit, consume quota, or alter target ordering.
+      // The normal target path performs the final atomic admission after the
+      // current transport has settled, so a readiness race still fails safely.
+      const findAdmissibleAlternate = async (
+        currentIndex: number
+      ): Promise<ComboAttemptBudgetAlternate | null> => {
+        if (signal?.aborted) return null;
+        for (let nextIndex = currentIndex + 1; nextIndex < orderedTargets.length; nextIndex++) {
+          const candidate = orderedTargets[nextIndex];
+          const candidateProvider = candidate.provider;
+          if (getCircuitBreaker(candidateProvider).getStatus().state === "OPEN") continue;
+          if (
+            resilienceSettings.providerCooldown.enabled &&
+            candidateProvider &&
+            candidateProvider !== "unknown" &&
+            isProviderInCooldown(
+              candidateProvider,
+              candidate.connectionId ?? undefined,
+              resilienceSettings
+            )
+          ) {
+            continue;
+          }
+          if (getExhaustedTargetSkipReason(candidate, exhaustedProviders, exhaustedConnections)) {
+            continue;
+          }
+          const readiness = resolveComboTargetReadiness(candidate);
+          if (readiness.state !== "ready") continue;
+          if (strategy !== "auto" && candidateProvider && candidate.connectionId) {
+            const quotaCutoff = await resolveQuotaExhaustionCutoffForTarget(
+              candidateProvider,
+              candidate.connectionId,
+              resilienceSettings,
+              quotaCutoffResetWindowConfig,
+              combo.name,
+              log
+            );
+            if (quotaCutoff.blocked) continue;
+          }
+          if (isModelAvailable) {
+            const allowRateLimitedConnection =
+              Boolean(candidateProvider && candidateProvider !== "unknown") &&
+              transientRateLimitedProviders.has(candidateProvider);
+            const available = await isModelAvailable(candidate.modelStr, {
+              ...candidate,
+              ...(allowRateLimitedConnection ? { allowRateLimitedConnection: true } : {}),
+            });
+            if (!available) continue;
+          }
+          if (candidate.connectionId) {
+            const gate = checkCredentialGate(
+              candidate.connectionId,
+              candidateProvider,
+              candidate.modelStr
+            );
+            if (gate.allowed === false) continue;
+          }
+          return {
+            targetIndex: nextIndex,
+            provider: candidateProvider || "unknown",
+            model: candidate.modelStr,
+          };
+        }
+        return null;
+      };
+
       const executeTarget = async (
         i: number
       ): Promise<{ ok: boolean; response?: Response } | null> => {
@@ -1297,14 +1375,100 @@ export async function handleComboChat({
               }
             }
           }
-          const result = await handleSingleModelWithTimeout(attemptBody, modelStr, {
-            ...targetForAttempt,
-            effectiveComboStrategy: strategy,
-            failoverBeforeRetry: config.failoverBeforeRetry,
-            comboTargetIndex: i,
-            rateLimitReadinessKey: targetReadiness.readinessKey,
-            rateLimitReadinessState: targetReadiness.state,
-          });
+          const attemptController = abortControllers.get(i)!;
+          const attemptBudgetSettings = resilienceSettings.comboAttemptBudget;
+          const attemptBudget =
+            attemptBudgetSettings.enabled && requiresVisibleTextResponse()
+              ? new ComboAttemptBudgetGuard({
+                  controller: attemptController,
+                  profile: resolveComboAttemptBudgetProfile(
+                    attemptBudgetSettings,
+                    provider,
+                    modelStr,
+                    rawModel
+                  ),
+                  recheckIntervalMs: attemptBudgetSettings.recheckIntervalMs,
+                  findAdmissibleAlternate: () => findAdmissibleAlternate(i),
+                  onEvent: (event: ComboAttemptBudgetEvent) => {
+                    const alternate = event.event === "aborted" ? event.alternate : null;
+                    if (correlationId) {
+                      markComboAttemptBudgetEvent(correlationId, {
+                        event: event.event,
+                        phase: event.phase,
+                        budgetMs: event.budgetMs,
+                        elapsedMs: "elapsedMs" in event ? event.elapsedMs : undefined,
+                        provider: provider || "unknown",
+                        model: modelStr,
+                        targetIndex: i,
+                        alternateProvider: alternate?.provider,
+                        alternateModel: alternate?.model,
+                        alternateTargetIndex: alternate?.targetIndex,
+                      });
+                    }
+                    if (event.event === "aborted") {
+                      log.warn(
+                        "COMBO",
+                        `${modelStr} exceeded ${event.phase} budget ${event.budgetMs}ms; aborting for sequential fallback to ${event.alternate.model}`
+                      );
+                    }
+                  },
+                })
+              : null;
+
+          const recordBudgetFallback = async (
+            trigger: ComboAttemptBudgetTrigger,
+            response: Response,
+            qualityClone?: Response
+          ): Promise<null> => {
+            attemptBudget?.dispose();
+            if (qualityClone) {
+              await settleRejectedQualityResponse(qualityClone, response);
+            } else if (response.body) {
+              await response.body.cancel().catch(() => {});
+            }
+            const failure = `Combo ${trigger.phase} budget exceeded after ${trigger.elapsedMs}ms`;
+            lastError = failure;
+            lastStatus = 504;
+            comboErrors.push({ model: modelStr, status: 504, error: failure });
+            recordComboRequest(combo.name, modelStr, {
+              success: false,
+              latencyMs: Date.now() - startTime,
+              fallbackCount,
+              strategy,
+              target: toRecordedTarget(target),
+            });
+            recordedAttempts++;
+            emit("combo.target.failed", {
+              comboName: combo.name,
+              targetIndex: i,
+              provider,
+              model: modelStr,
+              error: `Budget: ${trigger.phase}`,
+              latencyMs: Date.now() - startTime,
+            });
+            return null;
+          };
+
+          let result: Response;
+          try {
+            result = await handleSingleModelWithTimeout(attemptBody, modelStr, {
+              ...targetForAttempt,
+              effectiveComboStrategy: strategy,
+              failoverBeforeRetry: config.failoverBeforeRetry,
+              comboTargetIndex: i,
+              rateLimitReadinessKey: targetReadiness.readinessKey,
+              rateLimitReadinessState: targetReadiness.state,
+              upstreamTransportObserver: attemptBudget?.transportObserver ?? null,
+            });
+          } catch (error) {
+            attemptBudget?.dispose();
+            throw error;
+          }
+
+          const headerBudgetTrigger = attemptBudget?.getTrigger();
+          if (headerBudgetTrigger) {
+            return recordBudgetFallback(headerBudgetTrigger, result);
+          }
 
           // Success — validate response quality before returning
           if (result.ok) {
@@ -1323,12 +1487,22 @@ export async function handleComboChat({
             } catch {
               qualityClone = result;
             }
-            const quality = await validateResponseQuality(
-              qualityClone,
-              clientRequestedStream,
-              log,
-              config.responseValidation
-            );
+            let quality: Awaited<ReturnType<typeof validateResponseQuality>>;
+            try {
+              quality = await validateResponseQuality(
+                qualityClone,
+                clientRequestedStream,
+                log,
+                config.responseValidation,
+                () => attemptBudget?.markVisibleContent()
+              );
+            } finally {
+              attemptBudget?.dispose();
+            }
+            const visibleBudgetTrigger = attemptBudget?.getTrigger();
+            if (visibleBudgetTrigger) {
+              return recordBudgetFallback(visibleBudgetTrigger, result, qualityClone);
+            }
             releaseQualityClone(qualityClone, result, quality);
             if (!quality.valid) {
               releaseRejectedQualityResponse(qualityClone, result);
@@ -1585,6 +1759,8 @@ export async function handleComboChat({
 
             return { ok: true, response: result };
           }
+
+          attemptBudget?.dispose();
 
           // Extract error info from response
           let errorText = result.statusText || "";

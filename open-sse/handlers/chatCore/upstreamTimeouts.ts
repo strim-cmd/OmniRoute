@@ -178,9 +178,12 @@ export async function executeWithUpstreamStartTimeout<T>({
   });
 
   const executionPromise = execute(combinedController.signal);
+  let responseStarted = false;
 
   try {
-    return await Promise.race([executionPromise, timeoutPromise, abortPromise]);
+    const result = await Promise.race([executionPromise, timeoutPromise, abortPromise]);
+    responseStarted = true;
+    return result;
   } catch (error) {
     if (combinedController.signal.aborted) {
       // A timed-out/cancelled POST must be fully settled before the caller can
@@ -195,7 +198,10 @@ export async function executeWithUpstreamStartTimeout<T>({
     throw error;
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
-    if (abortListener) signal.removeEventListener("abort", abortListener);
+    // Fetch resolves at response headers. Retain the parent abort linkage while
+    // the returned streaming body is live; otherwise a post-header combo budget
+    // would reject only its wrapper and leave the HTTP/2 stream generating.
+    if (!responseStarted && abortListener) signal.removeEventListener("abort", abortListener);
     if (timeoutAbortListener) {
       timeoutController.signal.removeEventListener("abort", timeoutAbortListener);
     }

@@ -77,6 +77,26 @@ export interface ComboCooldownWaitSettings {
   budgetMs: number;
 }
 
+export interface ComboAttemptBudgetProfileSettings {
+  /** Request headers sent -> upstream response headers. */
+  responseHeadersMs: number;
+  /** Request headers sent -> first ordinary user-visible content. */
+  firstVisibleContentMs: number;
+}
+
+/**
+ * Combo-only productive-work budgets. They may abort an attempt only when a
+ * later target is currently admissible and no visible content was committed.
+ * Direct/single-model requests never read this policy.
+ */
+export interface ComboAttemptBudgetSettings {
+  enabled: boolean;
+  recheckIntervalMs: number;
+  default: ComboAttemptBudgetProfileSettings;
+  providers: Record<string, ComboAttemptBudgetProfileSettings>;
+  models: Record<string, ComboAttemptBudgetProfileSettings>;
+}
+
 /**
  * Per-connection concurrency limit for quota-share (`qtSd/…`) combos (FASE 2.1).
  * The quota-share gating in selectQuotaShareTarget is fail-open and cannot
@@ -192,6 +212,7 @@ export interface ResilienceSettings {
   providerBreaker: Record<AuthCategory, ProviderBreakerProfileSettings>;
   waitForCooldown: WaitForCooldownSettings;
   comboCooldownWait: ComboCooldownWaitSettings;
+  comboAttemptBudget: ComboAttemptBudgetSettings;
   quotaShareConcurrencyLimit: QuotaShareConcurrencyLimitSettings;
   providerCooldown: ProviderCooldownSettings;
   quotaPreflight: QuotaPreflightSettings;
@@ -205,6 +226,13 @@ export interface ResilienceSettingsPatch {
   providerBreaker?: Partial<Record<AuthCategory, Partial<ProviderBreakerProfileSettings>>>;
   waitForCooldown?: Partial<WaitForCooldownSettings>;
   comboCooldownWait?: Partial<ComboCooldownWaitSettings>;
+  comboAttemptBudget?: Partial<
+    Omit<ComboAttemptBudgetSettings, "default" | "providers" | "models">
+  > & {
+    default?: Partial<ComboAttemptBudgetProfileSettings>;
+    providers?: Record<string, Partial<ComboAttemptBudgetProfileSettings>>;
+    models?: Record<string, Partial<ComboAttemptBudgetProfileSettings>>;
+  };
   quotaShareConcurrencyLimit?: Partial<QuotaShareConcurrencyLimitSettings>;
   providerCooldown?: Partial<ProviderCooldownSettings>;
   quotaPreflight?: Partial<QuotaPreflightSettings>;

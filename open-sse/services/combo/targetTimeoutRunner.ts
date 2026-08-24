@@ -60,23 +60,32 @@ export function buildTargetTimeoutRunner(deps: {
     let onParentHedgeAbort: (() => void) | null = null;
     if (parentHedgeSignal) {
       if (parentHedgeSignal.aborted) {
-        timeoutController.abort(new Error("hedge-cancelled"));
+        timeoutController.abort(
+          parentHedgeSignal.reason instanceof Error
+            ? parentHedgeSignal.reason
+            : new Error("target-cancelled")
+        );
       } else {
         onParentHedgeAbort = () => {
-          timeoutController.abort(new Error("hedge-cancelled"));
+          timeoutController.abort(
+            parentHedgeSignal.reason instanceof Error
+              ? parentHedgeSignal.reason
+              : new Error("target-cancelled")
+          );
         };
         parentHedgeSignal.addEventListener("abort", onParentHedgeAbort, { once: true });
       }
     }
     const executionPromise = handleSingleModel(b, modelStr, targetWithSignal).catch((err) => {
-          if (timedOut) {
-            // Inner call rejected because we aborted it. The synthetic 524 from
-            // timeoutPromise already wins the race; return an empty response so
-            // the loser branch resolves cleanly without leaking err.message.
-            return new Response(null, { status: 599 });
-          }
-          return errorResponse(502, err?.message ?? "Upstream model error");
-        });
+      if (timedOut) {
+        // Inner call rejected because we aborted it. The synthetic 524 from
+        // timeoutPromise already wins the race; return an empty response so
+        // the loser branch resolves cleanly without leaking err.message.
+        return new Response(null, { status: 599 });
+      }
+      return errorResponse(502, err?.message ?? "Upstream model error");
+    });
+    let responseOwnsLiveBody = false;
     try {
       const response = await Promise.race([executionPromise, timeoutPromise]);
       if (timedOut) {
@@ -85,10 +94,15 @@ export function buildTargetTimeoutRunner(deps: {
         // can leave an orphan request generating concurrently with fallback.
         await executionPromise;
       }
+      responseOwnsLiveBody = !timedOut && response.body !== null;
       return response;
     } finally {
       clearTimeout(timeoutId);
-      if (parentHedgeSignal && onParentHedgeAbort) {
+      // A successful fetch settles when response headers arrive, while its SSE
+      // body is still live. Keep forwarding the parent target abort until that
+      // response becomes unreachable so post-header visible-content budgets can
+      // reset the real Undici stream. Failed/headerless paths clean up eagerly.
+      if (!responseOwnsLiveBody && parentHedgeSignal && onParentHedgeAbort) {
         parentHedgeSignal.removeEventListener("abort", onParentHedgeAbort);
       }
     }

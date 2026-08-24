@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildTargetTimeoutRunner } from "../../open-sse/services/combo/targetTimeoutRunner.ts";
+import type { ComboLogger, SingleModelTarget } from "../../open-sse/services/combo/types.ts";
 
-const noopLog = { warn() {}, info() {}, error() {}, debug() {} } as any;
+const noopLog: ComboLogger = { warn() {}, info() {}, error() {}, debug() {} };
 
 test("timeout<=0: passthrough direto (sem timer)", async () => {
   let called = false;
@@ -36,7 +37,7 @@ test("excede o limite: aborta e retorna 524 timed out", async () => {
     handleSingleModel: (_b, _m, target) =>
       new Promise<Response>((resolve) => {
         // resolve só se abortado (simula um upstream que respeita o signal)
-        const sig = (target as any)?.modelAbortSignal as AbortSignal | undefined;
+        const sig = (target as { modelAbortSignal?: AbortSignal } | undefined)?.modelAbortSignal;
         sig?.addEventListener("abort", () => resolve(new Response(null, { status: 599 })));
       }),
     comboTargetTimeoutMs: 20,
@@ -53,8 +54,7 @@ test("timeout waits for the aborted target to settle before fallback may continu
   const runner = buildTargetTimeoutRunner({
     handleSingleModel: (_b, _m, target) =>
       new Promise<Response>((resolve) => {
-        const signal = (target as { modelAbortSignal?: AbortSignal } | undefined)
-          ?.modelAbortSignal;
+        const signal = (target as { modelAbortSignal?: AbortSignal } | undefined)?.modelAbortSignal;
         assert.ok(signal);
         signal.addEventListener(
           "abort",
@@ -96,13 +96,36 @@ test("hedge do parent já abortado propaga o abort ao filho", async () => {
   const runner = buildTargetTimeoutRunner({
     handleSingleModel: (_b, _m, target) =>
       new Promise<Response>((resolve) => {
-        const sig = (target as any)?.modelAbortSignal as AbortSignal | undefined;
+        const sig = (target as { modelAbortSignal?: AbortSignal } | undefined)?.modelAbortSignal;
         if (sig?.aborted) sawAbort = true;
         resolve(new Response("ok"));
       }),
     comboTargetTimeoutMs: 1000,
     log: noopLog,
   });
-  await runner({}, "m", { modelAbortSignal: parent.signal } as any);
+  const parentTarget: SingleModelTarget = { modelAbortSignal: parent.signal };
+  await runner({}, "m", parentTarget);
   assert.equal(sawAbort, true);
+});
+
+test("parent target abort remains linked after streaming headers", async () => {
+  const parent = new AbortController();
+  let childSignal: AbortSignal | null = null;
+  const runner = buildTargetTimeoutRunner({
+    handleSingleModel: async (_body, _model, target) => {
+      childSignal = (target as { modelAbortSignal?: AbortSignal })?.modelAbortSignal ?? null;
+      return new Response(new ReadableStream({ start() {} }), {
+        headers: { "content-type": "text/event-stream" },
+      });
+    },
+    comboTargetTimeoutMs: 1000,
+    log: noopLog,
+  });
+  const parentTarget: SingleModelTarget = { modelAbortSignal: parent.signal };
+  const response = await runner({}, "m", parentTarget);
+  assert.equal(childSignal?.aborted, false);
+  parent.abort(new Error("visible-content-budget"));
+  assert.equal(childSignal?.aborted, true);
+  assert.match(String(childSignal?.reason), /visible-content-budget/);
+  await response.body?.cancel();
 });
